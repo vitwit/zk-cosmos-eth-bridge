@@ -102,3 +102,30 @@ $(BUILDDIR)/:
 # Default & all target
 .PHONY: all build build-linux install
 all: build
+
+###############################################################################
+###                                Linting                                  ###
+###############################################################################
+golangci_lint_cmd=golangci-lint
+golangci_version=v2.2.2
+
+lint: lint-go
+
+lint-go:
+	@echo "--> Running linter"
+	@go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(golangci_version)
+	@cd $(EVMD_DIR) && $(golangci_lint_cmd) run --timeout=15m -v
+
+lint-fix:
+	@go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(golangci_version)
+	@cd $(EVMD_DIR) && $(golangci_lint_cmd) run --timeout=15m --fix -v
+
+.PHONY: lint lint-fix lint-go
+
+format: format-go
+
+format-go:
+	find . -name '*.go' -type f -not -path "*.git*" | xargs gofumpt -w -l
+
+.PHONY: format format-go
+

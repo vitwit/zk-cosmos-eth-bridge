@@ -369,8 +369,8 @@ func initTestnetFiles(
 			nodeConfig.P2P.AllowDuplicateIP = true
 			nodeConfig.Instrumentation.Prometheus = false
 			nodeConfig.RPC.PprofListenAddress = ""
-			evmCfg.Config.API.Address = fmt.Sprintf("tcp://0.0.0.0:%d", sdkAPIPort+portOffset)
-			evmCfg.Config.GRPC.Address = fmt.Sprintf("0.0.0.0:%d", sdkGRPCPort+portOffset)
+			evmCfg.API.Address = fmt.Sprintf("tcp://0.0.0.0:%d", sdkAPIPort+portOffset)
+			evmCfg.GRPC.Address = fmt.Sprintf("0.0.0.0:%d", sdkGRPCPort+portOffset)
 			evmCfg.JSONRPC.Address = fmt.Sprintf("127.0.0.1:%d", evmJSONRPC+evmPortOffset)
 			evmCfg.JSONRPC.MetricsAddress = fmt.Sprintf("127.0.0.1:%d", evmJSONRPCMetrics+evmPortOffset)
 			evmCfg.JSONRPC.WsAddress = fmt.Sprintf("127.0.0.1:%d", evmJSONRPCWS+evmPortOffset)

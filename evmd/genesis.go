@@ -2,6 +2,7 @@ package evmd
 
 import (
 	"encoding/json"
+
 	"github.com/cosmos/evm/config"
 	testconstants "github.com/cosmos/evm/testutil/constants"
 	erc20types "github.com/cosmos/evm/x/erc20/types"

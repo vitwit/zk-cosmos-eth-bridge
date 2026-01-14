@@ -4,9 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-
 	"io"
-
 	"os"
 
 	"github.com/spf13/cast"
@@ -405,7 +403,7 @@ func NewExampleApp(
 
 	app.GovKeeper = *govKeeper.SetHooks(
 		govtypes.NewMultiGovHooks(
-			// register the governance hooks
+		// register the governance hooks
 		),
 	)
 
@@ -1065,7 +1063,7 @@ func (app *EVMD) GetMempool() sdkmempool.ExtMempool {
 }
 
 func (app *EVMD) GetAnteHandler() sdk.AnteHandler {
-	return app.BaseApp.AnteHandler()
+	return app.AnteHandler()
 }
 
 // GetTxConfig implements the TestingApp interface.
