@@ -1,0 +1,17 @@
+# Keys and Artifacts
+keys/
+build/
+.env
+
+# Go
+vendor/
+go.work
+
+# Compiled binaries
+/*compiler
+/*relayer
+/*deployer
+
+# Misc
+*.log
+.DS_Store
