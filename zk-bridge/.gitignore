@@ -3,6 +3,7 @@ keys/
 build/
 .env
 proof_event.json
+Verifier.sol
 
 # Go
 vendor/
