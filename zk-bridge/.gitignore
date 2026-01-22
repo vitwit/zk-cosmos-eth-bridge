@@ -1,0 +1,28 @@
+# Keys and Artifacts
+keys/
+build/
+.env
+proof_event.json
+Verifier.sol
+
+# Go
+vendor/
+go.mod.bak
+go.sum.bak
+go.work
+
+# Compiled binaries
+/*relayer
+/*deployer
+/*setup
+
+# ZK/Debug
+trace.txt
+full_trace.txt
+diagnostic_output.txt
+DebugVerifier.sol
+TestVerifier.sol
+
+# Misc
+*.log
+.DS_Store
