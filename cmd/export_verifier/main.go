@@ -5,8 +5,11 @@ import (
 	"log"
 	"os"
 
+	"golang.org/x/crypto/sha3"
+
 	"github.com/consensys/gnark-crypto/ecc"
 	"github.com/consensys/gnark/backend/groth16"
+	"github.com/consensys/gnark/backend/solidity"
 	"github.com/consensys/gnark/frontend"
 	"github.com/consensys/gnark/frontend/cs/r1cs"
 	"github.com/vitwit/zk-state-transition/testing/circuit"
@@ -20,7 +23,9 @@ const (
 func main() {
 	// 1. Compile the circuit
 	fmt.Println("Compiling circuit...")
-	c := circuit.NewInclusionCircuit(circuit.MaxTxLen, circuit.MaxDepth)
+
+	var c circuit.InclusionCircuit
+
 	compiledR1CS, err := frontend.Compile(ecc.BN254.ScalarField(), r1cs.NewBuilder, &c)
 	if err != nil {
 		log.Fatal("Compile failed:", err)
@@ -96,11 +101,12 @@ func main() {
 	}
 	defer f.Close()
 
-	err = vk.ExportSolidity(f)
+	err = vk.ExportSolidity(f, solidity.WithHashToFieldFunction(sha3.NewLegacyKeccak256()))
+
 	if err != nil {
 		log.Fatal("Export Solidity failed:", err)
 	}
 
-	fmt.Println("Verifier.sol generated successfully.")
-	fmt.Println("IMPORTANT: Redeploy the Verifier.sol contract on Ethereum!")
+	fmt.Println("✅ Verifier.sol generated successfully.")
+	fmt.Println("📝 IMPORTANT: Redeploy the Verifier.sol contract on Ethereum!")
 }

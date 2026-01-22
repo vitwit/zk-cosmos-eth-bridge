@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"math/big"
@@ -83,7 +84,7 @@ const CosmosLockABI = `[
 		]`
 
 // EthereumBridge ABI for minting
-const EthereumBridgeABI = `[
+const EthereumBridgeABI = ` [
 			{
 				"inputs": [
 					{
@@ -154,24 +155,24 @@ const EthereumBridgeABI = `[
 			{
 				"inputs": [
 					{
-						"internalType": "uint256[2]",
-						"name": "a",
-						"type": "uint256[2]"
-					},
-					{
-						"internalType": "uint256[2][2]",
-						"name": "b",
-						"type": "uint256[2][2]"
+						"internalType": "uint256[8]",
+						"name": "proof",
+						"type": "uint256[8]"
 					},
 					{
 						"internalType": "uint256[2]",
-						"name": "c",
+						"name": "commitments",
 						"type": "uint256[2]"
 					},
 					{
-						"internalType": "uint256[]",
+						"internalType": "uint256[2]",
+						"name": "commitmentPok",
+						"type": "uint256[2]"
+					},
+					{
+						"internalType": "uint256[8]",
 						"name": "input",
-						"type": "uint256[]"
+						"type": "uint256[8]"
 					},
 					{
 						"internalType": "bytes32",
@@ -271,7 +272,7 @@ const EthereumBridgeABI = `[
 				"stateMutability": "view",
 				"type": "function"
 			}
-		]`
+		],`
 
 func main() {
 	if len(os.Args) < 7 {
@@ -333,6 +334,13 @@ func main() {
 
 	query := ethereum.FilterQuery{
 		Addresses: []common.Address{lockAddr},
+	}
+
+	// Check if RPC is HTTP, if so, default to polling
+	if strings.HasPrefix(ethRPC, "http") {
+		fmt.Println("HTTP RPC detected. Defaulting to polling mode...")
+		pollLogs(client, query, contractAbi, bridgeAbi, ethClient, bridgeAddr, privKeyHex, evmosCometRPC, initialBlock, p)
+		return
 	}
 
 	logs := make(chan types.Log)
@@ -422,7 +430,7 @@ func processLog(vLog types.Log, contractAbi abi.ABI, bridgeAbi abi.ABI, ethClien
 
 	fmt.Printf("Generating ZK proof for Cosmos Tx: %s at height %d\n", cosmosTxHash, vLog.BlockNumber)
 
-	proof, err := p.GenerateInclusionProof(cometRPC, int64(vLog.BlockNumber), cosmosTxHash, event.LockId.Uint64(), event.Amount.String(), event.EthDestination.Hex())
+	proof, err := p.GenerateInclusionProof(cometRPC, int64(vLog.BlockNumber), int(vLog.TxIndex), event.LockId.Uint64(), event.Amount.String(), event.EthDestination.Hex())
 	if err != nil {
 		fmt.Printf("Error generating proof: %v\n", err)
 		return
@@ -444,8 +452,12 @@ func processLog(vLog types.Log, contractAbi abi.ABI, bridgeAbi abi.ABI, ethClien
 			return
 		}
 		fmt.Printf("Root registration tx submitted: %s\n", txHash.Hex())
-		fmt.Println("Waiting for root registration to be mined...")
-		time.Sleep(5 * time.Second) // Simple wait for POC
+
+		_, err = waitForReceipt(ethClient, txHash)
+		if err != nil {
+			fmt.Printf("Error waiting for root registration: %v\n", err)
+			return
+		}
 	} else {
 		fmt.Println("Root already registered.")
 	}
@@ -542,56 +554,200 @@ func submitMintTx(client *ethclient.Client, bridgeAddr common.Address, bridgeAbi
 	}
 
 	// Convert proof to big.Int for Solidity
-	a := [2]*big.Int{new(big.Int), new(big.Int)}
-	a[0].SetString(proof.A[0][2:], 16)
-	a[1].SetString(proof.A[1][2:], 16)
+	proofFlat := [8]*big.Int{}
+	proofFlat[0] = new(big.Int)
+	proofFlat[0].SetString(proof.A[0][2:], 16)
+	proofFlat[1] = new(big.Int)
+	proofFlat[1].SetString(proof.A[1][2:], 16)
 
-	b := [2][2]*big.Int{
-		{new(big.Int), new(big.Int)},
-		{new(big.Int), new(big.Int)},
+	proofFlat[2] = new(big.Int)
+	proofFlat[2].SetString(proof.B[0][0][2:], 16)
+	proofFlat[3] = new(big.Int)
+	proofFlat[3].SetString(proof.B[0][1][2:], 16)
+	proofFlat[4] = new(big.Int)
+	proofFlat[4].SetString(proof.B[1][0][2:], 16)
+	proofFlat[5] = new(big.Int)
+	proofFlat[5].SetString(proof.B[1][1][2:], 16)
+
+	proofFlat[6] = new(big.Int)
+	proofFlat[6].SetString(proof.C[0][2:], 16)
+	proofFlat[7] = new(big.Int)
+	proofFlat[7].SetString(proof.C[1][2:], 16)
+
+	// Commitments and CommitmentPok
+	commitments := [2]*big.Int{new(big.Int), new(big.Int)}
+	commitments[0].SetString(proof.Commitments[0][2:], 16)
+	commitments[1].SetString(proof.Commitments[1][2:], 16)
+
+	commitmentPok := [2]*big.Int{new(big.Int), new(big.Int)}
+	commitmentPok[0].SetString(proof.CommitmentPok[0][2:], 16)
+	commitmentPok[1].SetString(proof.CommitmentPok[1][2:], 16)
+
+	// Convert inputs to fixed-size array [8]*big.Int
+	if len(proof.Inputs) != 8 {
+		return common.Hash{}, fmt.Errorf("expected 8 inputs, got %d", len(proof.Inputs))
 	}
-	b[0][0].SetString(proof.B[0][0][2:], 16)
-	b[0][1].SetString(proof.B[0][1][2:], 16)
-	b[1][0].SetString(proof.B[1][0][2:], 16)
-	b[1][1].SetString(proof.B[1][1][2:], 16)
 
-	c := [2]*big.Int{new(big.Int), new(big.Int)}
-	c[0].SetString(proof.C[0][2:], 16)
-	c[1].SetString(proof.C[1][2:], 16)
-
-	inputs := make([]*big.Int, len(proof.Inputs))
+	var inputs [8]*big.Int
 	for i, input := range proof.Inputs {
 		inputs[i] = new(big.Int)
 		inputs[i].SetString(input, 10)
 	}
 
-	// Reconstruct txHash from proof inputs (last 32 bytes)
-	// Reconstruct txHash from proof inputs (last 32 bytes of the first 64 inputs)
-	var txHash [32]byte
-	for i := 0; i < 32; i++ {
-		txHash[i] = byte(inputs[i+32].Uint64())
+	// Reconstruct txHash - CRITICAL: This must match what the contract expects
+	// The txHash should be the original Cosmos transaction hash
+	var txHashBytes [32]byte
+
+	// Reconstruct txHash from TxHigh (inputs[2]) and TxLow (inputs[3])
+	txHashInt := new(big.Int).Or(new(big.Int).Lsh(inputs[2], 128), inputs[3])
+	txHashInt.FillBytes(txHashBytes[:])
+
+	// Extended Debug logging
+	fmt.Printf("\n=== Mint Transaction Debug ===\n")
+	fmt.Printf("Bridge Address: %s\n", bridgeAddr.Hex())
+	fmt.Printf("To Address: %s\n", to.Hex())
+	fmt.Printf("Amount: %s wei\n", amount.String())
+	fmt.Printf("\n--- Proof Components ---\n")
+	fmt.Printf("Proof A[0]: %s\n", proofFlat[0].String())
+	fmt.Printf("Proof A[1]: %s\n", proofFlat[1].String())
+	fmt.Printf("Proof B[0][0]: %s\n", proofFlat[2].String())
+	fmt.Printf("Proof B[0][1]: %s\n", proofFlat[3].String())
+	fmt.Printf("Proof B[1][0]: %s\n", proofFlat[4].String())
+	fmt.Printf("Proof B[1][1]: %s\n", proofFlat[5].String())
+	fmt.Printf("Proof C[0]: %s\n", proofFlat[6].String())
+	fmt.Printf("Proof C[1]: %s\n", proofFlat[7].String())
+	fmt.Printf("\n--- Commitments ---\n")
+	fmt.Printf("Commitment[0]: %s\n", commitments[0].String())
+	fmt.Printf("Commitment[1]: %s\n", commitments[1].String())
+	fmt.Printf("CommitmentPok[0]: %s\n", commitmentPok[0].String())
+	fmt.Printf("CommitmentPok[1]: %s\n", commitmentPok[1].String())
+
+	fmt.Printf("\n--- Public Inputs Breakdown ---\n")
+	fmt.Printf("Root (inputs[0:2]): 0x%x%x\n", inputs[0], inputs[1])
+	fmt.Printf("TxHash (inputs[2:4]): 0x%x%x\n", inputs[2], inputs[3])
+	fmt.Printf("LockID (input[5]): %s\n", inputs[5].String())
+	fmt.Printf("Amount (input[6:8]): %s (high: %s, low: %s)\n",
+		new(big.Int).Or(new(big.Int).Lsh(inputs[6], 128), inputs[7]).String(),
+		inputs[6].String(), inputs[7].String())
+	fmt.Printf("Destination (input[4]): 0x%x\n", inputs[4])
+
+	// Verify amount matches
+	reconstructedAmount := new(big.Int).Or(new(big.Int).Lsh(inputs[6], 128), inputs[7])
+	if reconstructedAmount.Cmp(amount) != 0 {
+		fmt.Printf("⚠️  WARNING: Amount mismatch! Proof: %s, Param: %s\n", reconstructedAmount.String(), amount.String())
 	}
 
-	data, err := bridgeAbi.Pack("mint", a, b, c, inputs, txHash, to, amount)
+	fmt.Printf("\n--- Transaction Parameters ---\n")
+	fmt.Printf("Chain ID: %s\n", chainID.String())
+	fmt.Printf("From: %s\n", auth.From.Hex())
+
+	// First, estimate gas to see if it would succeed
+	callData, err := bridgeAbi.Pack("mint", proofFlat, commitments, commitmentPok, inputs, txHashBytes, to, amount)
 	if err != nil {
-		return common.Hash{}, err
+		return common.Hash{}, fmt.Errorf("error packing data: %v", err)
 	}
+
+	fmt.Printf("Calldata size: %d bytes\n", len(callData))
+	fmt.Printf("Calldata size: %d bytes\n", len(callData))
+	fmt.Printf("Calldata: %s\n", hex.EncodeToString(callData))
+
+	// Skip gas estimation - it fails even though the transaction succeeds
+	// Use fixed gas limit instead (must be under block gas limit of 10M)
+	fmt.Printf("Using fixed gas limit for ZK proof verification...\n")
+
+	msg := ethereum.CallMsg{
+		From: auth.From,
+		To:   &bridgeAddr,
+		Data: callData,
+	}
+
+	estimatedGas, err := client.EstimateGas(context.Background(), msg)
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("tx would revert or exceed block gas: %v", err)
+	}
+
+	fmt.Printf("Estimated gas: %d\n", estimatedGas)
+
+	if estimatedGas > 9_500_000 {
+		return common.Hash{}, fmt.Errorf("proof too expensive: %d gas > block limit", estimatedGas)
+	}
+
+	gasLimit := estimatedGas + 100_000
+	fmt.Printf("Gas limit: %d\n", gasLimit)
 
 	nonce, err := client.PendingNonceAt(context.Background(), auth.From)
 	if err != nil {
 		return common.Hash{}, err
 	}
+	fmt.Printf("Nonce: %d\n", nonce)
 
 	gasPrice, err := client.SuggestGasPrice(context.Background())
 	if err != nil {
 		return common.Hash{}, err
 	}
+	fmt.Printf("Gas price: %s wei\n", gasPrice.String())
 
-	tx := types.NewTransaction(nonce, bridgeAddr, big.NewInt(0), 1000000, gasPrice, data)
+	fmt.Printf("==============================\n\n")
+
+	tx := types.NewTransaction(nonce, bridgeAddr, big.NewInt(0), gasLimit, gasPrice, callData)
 	signedTx, err := auth.Signer(auth.From, tx)
 	if err != nil {
 		return common.Hash{}, err
 	}
 
-	return signedTx.Hash(), client.SendTransaction(context.Background(), signedTx)
+	err = client.SendTransaction(context.Background(), signedTx)
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("failed to send transaction: %v", err)
+	}
+
+	return signedTx.Hash(), nil
+}
+
+// Helper function to check transaction receipt and decode revert reason
+func waitForReceipt(client *ethclient.Client, txHash common.Hash) (*types.Receipt, error) {
+	fmt.Printf("Waiting for transaction %s to be mined...\n", txHash.Hex())
+
+	for i := 0; i < 60; i++ {
+		receipt, err := client.TransactionReceipt(context.Background(), txHash)
+		if err == nil {
+			if receipt.Status == 0 {
+				fmt.Printf("❌ Transaction failed!\n")
+				fmt.Printf("Gas used: %d\n", receipt.GasUsed)
+
+				// Try to get revert reason by replaying the transaction
+				tx, _, err := client.TransactionByHash(context.Background(), txHash)
+				if err == nil {
+					// Get the from address from the transaction
+					from, err := types.Sender(types.LatestSignerForChainID(tx.ChainId()), tx)
+					if err == nil {
+						msg := ethereum.CallMsg{
+							From:     from,
+							To:       tx.To(),
+							Gas:      tx.Gas(),
+							GasPrice: tx.GasPrice(),
+							Value:    tx.Value(),
+							Data:     tx.Data(),
+						}
+						_, callErr := client.CallContract(context.Background(), msg, receipt.BlockNumber)
+						if callErr != nil {
+							fmt.Printf("Revert reason: %v\n", callErr)
+						}
+					}
+				}
+			} else {
+				fmt.Printf("✅ Transaction successful!\n")
+			}
+			return receipt, nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+
+	return nil, fmt.Errorf("timeout waiting for transaction receipt")
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

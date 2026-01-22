@@ -2,11 +2,11 @@ pragma solidity ^0.8.0;
 
 interface IVerifier {
     function verifyProof(
-        uint256[2] memory a,
-        uint256[2][2] memory b,
-        uint256[2] memory c,
-        uint256[86] memory input // 32 Root + 32 TxHash + 1 LockID + 1 Amount + 20 Destination
-    ) external view returns (bool);
+        uint256[8] calldata proof,
+        uint256[2] calldata commitments,
+        uint256[2] calldata commitmentPok,
+        uint256[8] calldata input
+    ) external view; // reverts on failure, no return value
 }
 
 import "./WrappedEVMS.sol";
@@ -36,46 +36,32 @@ contract MintBridge {
     }
 
     function mint(
-        uint256[2] memory a,
-        uint256[2][2] memory b,
-        uint256[2] memory c,
-        uint256[86] memory input,
+        uint256[8] memory proof,
+        uint256[2] memory commitments,
+        uint256[2] memory commitmentPok,
+        uint256[8] memory input,
         bytes32 _txHash,
         address _to,
         uint256 _amount
     ) external {
-        // 1. Verify Proof
-        require(verifier.verifyProof(a, b, c, input), "Invalid Proof");
+        // 1. Verify Proof (reverts on failure)
+        verifier.verifyProof(proof, commitments, commitmentPok, input);
 
-        // 2. Check Root (input[0..31] -> bytes32)
-        // The circuit outputs Root as 32 bytes (32 field elements).
-        // We need to reconstruct the bytes32 root from input[0..31].
-        // Wait, the Relayer registers `proof.Root` which is [32]byte.
-        // The circuit `Root` is [32]uints.U8.
-        // So input[0] is the first byte of the root, input[1] is the second...
-        
-        uint256 rootVal = 0;
-        for (uint i = 0; i < 32; i++) {
-            rootVal = (rootVal << 8) | input[i];
-        }
-        bytes32 root = bytes32(rootVal);
-        
+        // 2. Check Root (input[0], input[1] -> bytes32)
+        bytes32 root = bytes32((input[0] << 128) | input[1]);
         require(validRoots[root], "Root not registered");
 
-        // 3. Extract LockID (input[64])
-        uint256 lockId = input[64];
+        // 3. Extract LockID (input[5])
+        uint256 lockId = input[5];
         require(!usedLockIds[lockId], "LockID already used");
         usedLockIds[lockId] = true;
 
-        // 4. Verify Amount matches input[65]
-        require(_amount == input[65], "Amount mismatch");
+        // 4. Verify Amount matches input[6], input[7]
+        uint256 amount = (input[6] << 128) | input[7];
+        require(_amount == amount, "Amount mismatch");
 
-        // 5. Verify Destination matches input[66..85]
-        uint160 destVal = 0;
-        for (uint i = 0; i < 20; i++) {
-            destVal = (destVal << 8) | uint160(input[66 + i]);
-        }
-        require(_to == address(destVal), "Destination mismatch");
+        // 5. Verify Destination matches input[4]
+        require(_to == address(uint160(input[4])), "Destination mismatch");
 
         token.mint(_to, _amount);
         emit Mint(_to, _amount, _txHash);

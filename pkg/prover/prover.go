@@ -1,7 +1,6 @@
 package prover
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -9,13 +8,18 @@ import (
 	"fmt"
 	"math/big"
 	"os"
-	"strconv"
 	"strings"
+
+	"github.com/ethereum/go-ethereum/crypto"
 
 	"github.com/cometbft/cometbft/crypto/merkle"
 	"github.com/cometbft/cometbft/rpc/client/http"
 	"github.com/consensys/gnark-crypto/ecc"
+	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
+	"github.com/consensys/gnark/backend"
 	"github.com/consensys/gnark/backend/groth16"
+	groth16_bn254 "github.com/consensys/gnark/backend/groth16/bn254"
+	"github.com/consensys/gnark/backend/solidity"
 	"github.com/consensys/gnark/constraint"
 	"github.com/consensys/gnark/frontend"
 	"github.com/consensys/gnark/frontend/cs/r1cs"
@@ -23,24 +27,28 @@ import (
 )
 
 type ProofData struct {
-	Root        [32]byte
-	A           [2]string
-	B           [2][2]string
-	C           [2]string
-	Inputs      []string
-	LockID      uint64
-	Amount      string
-	Destination string
+	Root          [32]byte
+	A             [2]string
+	B             [2][2]string
+	C             [2]string
+	Commitments   [2]string
+	CommitmentPok [2]string
+	Inputs        []string
+	LockID        uint64
+	Amount        string
+	Destination   string
 }
 
 type Prover struct {
 	CompiledR1CS constraint.ConstraintSystem
 	ProvingKey   groth16.ProvingKey
+	VerifyingKey groth16.VerifyingKey
 }
 
 func NewProver() (*Prover, error) {
 	fmt.Println("Initializing ZK Prover...")
-	c := circuit.NewInclusionCircuit(circuit.MaxTxLen, circuit.MaxDepth)
+
+	var c circuit.InclusionCircuit
 
 	fmt.Println("Compiling circuit...")
 	compiledR1CS, err := frontend.Compile(ecc.BN254.ScalarField(), r1cs.NewBuilder, &c)
@@ -48,10 +56,9 @@ func NewProver() (*Prover, error) {
 		return nil, err
 	}
 
-	// Try to load keys from disk
 	pkPath := "proving.key"
-	vkPath := "verification.key"
 	var pk groth16.ProvingKey
+	var vk groth16.VerifyingKey
 
 	if _, err := os.Stat(pkPath); err == nil {
 		fmt.Println("Loading proving key from disk...")
@@ -65,9 +72,19 @@ func NewProver() (*Prover, error) {
 		if err != nil {
 			return nil, err
 		}
+
+		vk = groth16.NewVerifyingKey(ecc.BN254)
+		f, err = os.Open("verification.key")
+		if err != nil {
+			return nil, err
+		}
+		_, err = vk.ReadFrom(f)
+		f.Close()
+		if err != nil {
+			return nil, err
+		}
 	} else {
 		fmt.Println("Generating proving/verifying keys (this may take a few minutes)...")
-		var vk groth16.VerifyingKey
 		pk, vk, err = groth16.Setup(compiledR1CS)
 		if err != nil {
 			return nil, err
@@ -75,37 +92,37 @@ func NewProver() (*Prover, error) {
 
 		fmt.Println("Saving proving key to disk...")
 		f, err := os.Create(pkPath)
-		if err != nil {
-			fmt.Printf("Warning: failed to save proving key: %v\n", err)
-		} else {
-			_, err = pk.WriteTo(f)
+		if err == nil {
+			pk.WriteTo(f)
 			f.Close()
-			if err != nil {
-				fmt.Printf("Warning: failed to write proving key: %v\n", err)
-			}
 		}
 
 		fmt.Println("Saving verification key to disk...")
-		f, err = os.Create(vkPath)
-		if err != nil {
-			fmt.Printf("Warning: failed to save verification key: %v\n", err)
-		} else {
-			_, err = vk.WriteTo(f)
+		f, err = os.Create("verification.key")
+		if err == nil {
+			vk.WriteTo(f)
 			f.Close()
-			if err != nil {
-				fmt.Printf("Warning: failed to write verification key: %v\n", err)
-			}
 		}
+	}
+
+	// Debug: Print Pedersen points from VK
+	vk_bn254 := vk.(*groth16_bn254.VerifyingKey)
+	if len(vk_bn254.CommitmentKeys) > 0 {
+		fmt.Printf("DEBUG: VK Pedersen G X0: %s\n", vk_bn254.CommitmentKeys[0].G.X.A0.BigInt(new(big.Int)).String())
+		fmt.Printf("DEBUG: VK Pedersen G X1: %s\n", vk_bn254.CommitmentKeys[0].G.X.A1.BigInt(new(big.Int)).String())
+		fmt.Printf("DEBUG: VK Pedersen GSigmaNeg X0: %s\n", vk_bn254.CommitmentKeys[0].GSigmaNeg.X.A0.BigInt(new(big.Int)).String())
+		fmt.Printf("DEBUG: VK Pedersen GSigmaNeg X1: %s\n", vk_bn254.CommitmentKeys[0].GSigmaNeg.X.A1.BigInt(new(big.Int)).String())
 	}
 
 	fmt.Println("Prover initialized successfully.")
 	return &Prover{
 		CompiledR1CS: compiledR1CS,
 		ProvingKey:   pk,
+		VerifyingKey: vk,
 	}, nil
 }
 
-func (p *Prover) GenerateInclusionProof(rpcURL string, height int64, txHashStr string, lockID uint64, amountStr string, ethDest string) (*ProofData, error) {
+func (p *Prover) GenerateInclusionProof(rpcURL string, height int64, txIndex int, lockID uint64, amountStr string, ethDest string) (*ProofData, error) {
 	client, err := http.New(rpcURL, "/websocket")
 	if err != nil {
 		return nil, err
@@ -116,84 +133,24 @@ func (p *Prover) GenerateInclusionProof(rpcURL string, height int64, txHashStr s
 		return nil, err
 	}
 
-	var txIndex int
-	var tx []byte
-
-	targetHash, err := hex.DecodeString(txHashStr)
-	if err != nil {
-		return nil, err
+	if txIndex < 0 || txIndex >= len(block.Block.Txs) {
+		return nil, fmt.Errorf("transaction index %d out of bounds (total txs: %d)", txIndex, len(block.Block.Txs))
 	}
+	tx := block.Block.Txs[txIndex]
 
-	found := false
-	for i, t := range block.Block.Txs {
-		h := sha256.Sum256(t)
-		if bytes.Equal(h[:], targetHash) {
-			txIndex = i
-			tx = t
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		// Try searching by Ethereum hash attribute
-		query := fmt.Sprintf("ethereum_tx.ethereumTxHash='0x%s'", txHashStr)
-		searchRes, err := client.TxSearch(context.Background(), query, false, nil, nil, "")
-		if err == nil && len(searchRes.Txs) > 0 {
-			for _, t := range searchRes.Txs {
-				if t.Height == height {
-					tx = t.Tx
-					// Find the index in the block
-					for i, blockTx := range block.Block.Txs {
-						if bytes.Equal(blockTx, tx) {
-							txIndex = i
-							found = true
-							break
-						}
-					}
-					break
-				}
-			}
-		}
-	}
-
-	if !found {
-		return nil, fmt.Errorf("transaction with hash %s not found in block %d", txHashStr, height)
-	}
-
-	// Parse amount string to big.Int
-	amountBig, ok := new(big.Int).SetString(amountStr, 10)
-	if !ok {
-		return nil, fmt.Errorf("invalid amount string: %s", amountStr)
-	}
-
-	// Parse destination address
+	amountBig, _ := new(big.Int).SetString(amountStr, 10)
 	ethDestClean := strings.TrimPrefix(ethDest, "0x")
-	ethDestBytes, err := hex.DecodeString(ethDestClean)
-	if err != nil {
-		return nil, fmt.Errorf("invalid eth destination: %v", err)
-	}
-	if len(ethDestBytes) != 20 {
-		return nil, fmt.Errorf("invalid eth destination length: %d", len(ethDestBytes))
-	}
-
-	// Compute TxHash of the transaction
+	ethDestBytes, _ := hex.DecodeString(ethDestClean)
 	txHash := sha256.Sum256(tx)
 
-	// Construct the modified leaf payload: TxHash || LockID || Amount || Destination
-	// LockID (32 bytes, Big Endian, padded)
 	lockIDBytes := make([]byte, 32)
 	binary.BigEndian.PutUint64(lockIDBytes[24:], lockID)
-
-	// Amount (32 bytes, Big Endian)
 	amountBytes := make([]byte, 32)
 	amountBig.FillBytes(amountBytes)
 
-	// Re-construct the items list for Merkle tree
 	merkleItems := make([][]byte, len(block.Block.Txs))
 	for i, t := range block.Block.Txs {
 		if i == txIndex {
-			// Target item: TxHash || LockID || Amount || Destination
 			payload := make([]byte, 0, 32+32+32+20)
 			payload = append(payload, txHash[:]...)
 			payload = append(payload, lockIDBytes...)
@@ -201,7 +158,6 @@ func (p *Prover) GenerateInclusionProof(rpcURL string, height int64, txHashStr s
 			payload = append(payload, ethDestBytes...)
 			merkleItems[i] = payload
 		} else {
-			// Other items: SHA256(Tx)
 			h := sha256.Sum256(t)
 			merkleItems[i] = h[:]
 		}
@@ -209,30 +165,23 @@ func (p *Prover) GenerateInclusionProof(rpcURL string, height int64, txHashStr s
 
 	root, proofs := merkle.ProofsFromByteSlices(merkleItems)
 	proof := proofs[txIndex]
+	var witness circuit.InclusionCircuit
 
-	// Note: The computed root will NOT match block.Block.Header.DataHash because we modified the leaf.
-	// We log a warning but proceed, as the Relayer will register this new Root.
-	if !bytes.Equal(root, block.Block.Header.DataHash) {
-		fmt.Printf("Warning: Computed Root (%x) does not match Block Header DataHash (%x). This is expected due to leaf modification.\n", root, block.Block.Header.DataHash)
+	// Helper to split 32 bytes into high/low 16 bytes
+	split32 := func(b []byte) (*big.Int, *big.Int) {
+		high := new(big.Int).SetBytes(b[:16])
+		low := new(big.Int).SetBytes(b[16:])
+		return high, low
 	}
 
-	// Pad proof to circuit.MaxDepth
-	if len(proof.Aunts) > circuit.MaxDepth {
-		return nil, fmt.Errorf("proof too deep: %d > %d", len(proof.Aunts), circuit.MaxDepth)
-	}
-
-	witness := circuit.NewInclusionCircuit(circuit.MaxTxLen, circuit.MaxDepth)
-	for i := 0; i < 32; i++ {
-		witness.Root[i].Val = root[i]
-		witness.TxHash[i].Val = txHash[i]
-	}
-
+	witness.RootHigh, witness.RootLow = split32(root)
+	witness.TxHigh, witness.TxLow = split32(txHash[:])
+	witness.Dest = circuit.PackBytesBE(ethDestBytes)
 	witness.LockID = lockID
-	witness.Amount = amountBig
 
-	for i := 0; i < 20; i++ {
-		witness.Destination[i].Val = ethDestBytes[i]
-	}
+	amtBytes := make([]byte, 32)
+	amountBig.FillBytes(amtBytes)
+	witness.AmtHigh, witness.AmtLow = split32(amtBytes)
 
 	currentIndex := int64(txIndex)
 	for i := 0; i < len(proof.Aunts); i++ {
@@ -243,7 +192,7 @@ func (p *Prover) GenerateInclusionProof(rpcURL string, height int64, txHashStr s
 		witness.IsActive[i] = 1
 		currentIndex /= 2
 	}
-	// Fill remaining proof levels with zeros (or identity)
+
 	for i := len(proof.Aunts); i < circuit.MaxDepth; i++ {
 		for j := 0; j < 32; j++ {
 			witness.Proof[i][j].Val = 0
@@ -257,53 +206,98 @@ func (p *Prover) GenerateInclusionProof(rpcURL string, height int64, txHashStr s
 		return nil, err
 	}
 
-	zkProof, err := groth16.Prove(p.CompiledR1CS, p.ProvingKey, fullWitness)
+	zkProof, err := groth16.Prove(p.CompiledR1CS, p.ProvingKey, fullWitness, solidity.WithProverTargetSolidityVerifier(backend.GROTH16))
 	if err != nil {
 		return nil, err
 	}
 
-	var buf bytes.Buffer
-	zkProof.WriteRawTo(&buf)
-	proofBytes := buf.Bytes()
+	// Helper to pad hex string to 32 bytes (64 chars)
+	padHex32 := func(s string) string {
+		if len(s) >= 64 {
+			return s
+		}
+		return strings.Repeat("0", 64-len(s)) + s
+	}
 
+	g16proof := zkProof.(*groth16_bn254.Proof)
 	res := &ProofData{
 		A: [2]string{
-			"0x" + hex.EncodeToString(proofBytes[0:32]),
-			"0x" + hex.EncodeToString(proofBytes[32:64]),
+			"0x" + padHex32(g16proof.Ar.X.BigInt(new(big.Int)).Text(16)),
+			"0x" + padHex32(g16proof.Ar.Y.BigInt(new(big.Int)).Text(16)),
 		},
 		B: [2][2]string{
-			{"0x" + hex.EncodeToString(proofBytes[64:96]), "0x" + hex.EncodeToString(proofBytes[96:128])},
-			{"0x" + hex.EncodeToString(proofBytes[128:160]), "0x" + hex.EncodeToString(proofBytes[160:192])},
+			{
+				"0x" + padHex32(g16proof.Bs.X.A1.BigInt(new(big.Int)).Text(16)),
+				"0x" + padHex32(g16proof.Bs.X.A0.BigInt(new(big.Int)).Text(16)),
+			},
+			{
+				"0x" + padHex32(g16proof.Bs.Y.A1.BigInt(new(big.Int)).Text(16)),
+				"0x" + padHex32(g16proof.Bs.Y.A0.BigInt(new(big.Int)).Text(16)),
+			},
 		},
 		C: [2]string{
-			"0x" + hex.EncodeToString(proofBytes[192:224]),
-			"0x" + hex.EncodeToString(proofBytes[224:256]),
+			"0x" + padHex32(g16proof.Krs.X.BigInt(new(big.Int)).Text(16)),
+			"0x" + padHex32(g16proof.Krs.Y.BigInt(new(big.Int)).Text(16)),
 		},
 	}
+
+	fmt.Printf("Number of commitments: %d\n", len(g16proof.Commitments))
+	if len(g16proof.Commitments) > 0 {
+		res.Commitments = [2]string{
+			"0x" + padHex32(g16proof.Commitments[0].X.BigInt(new(big.Int)).Text(16)),
+			"0x" + padHex32(g16proof.Commitments[0].Y.BigInt(new(big.Int)).Text(16)),
+		}
+		res.CommitmentPok = [2]string{
+			"0x" + padHex32(g16proof.CommitmentPok.X.BigInt(new(big.Int)).Text(16)),
+			"0x" + padHex32(g16proof.CommitmentPok.Y.BigInt(new(big.Int)).Text(16)),
+		}
+
+		// Debug: Compute commitment hashes to compare with Solidity
+		cx := g16proof.Commitments[0].X.BigInt(new(big.Int))
+		cy := g16proof.Commitments[0].Y.BigInt(new(big.Int))
+		cxBytes := make([]byte, 32)
+		cx.FillBytes(cxBytes)
+		cyBytes := make([]byte, 32)
+		cy.FillBytes(cyBytes)
+
+		packed := append(cxBytes, cyBytes...)
+		shaHash := sha256.Sum256(packed)
+		keccakHash := crypto.Keccak256(packed)
+
+		fmt.Printf("DEBUG: Commitment X: 0x%x\n", cxBytes)
+		fmt.Printf("DEBUG: Commitment Y: 0x%x\n", cyBytes)
+		fmt.Printf("DEBUG: SHA256 Hash: 0x%x\n", shaHash)
+		fmt.Printf("DEBUG: Keccak256 Hash: 0x%x\n", keccakHash)
+		fmt.Printf("DEBUG: Scalar Field R: %s\n", ecc.BN254.ScalarField().String())
+
+		shaChallenge := new(big.Int).SetBytes(shaHash[:])
+		shaChallenge.Mod(shaChallenge, ecc.BN254.ScalarField())
+		fmt.Printf("DEBUG: SHA256 Challenge (mod R): %s\n", shaChallenge.String())
+
+		keccakChallenge := new(big.Int).SetBytes(keccakHash)
+		keccakChallenge.Mod(keccakChallenge, ecc.BN254.ScalarField())
+		fmt.Printf("DEBUG: Keccak256 Challenge (mod R): %s\n", keccakChallenge.String())
+
+	} else {
+		res.Commitments = [2]string{"0x0", "0x0"}
+		res.CommitmentPok = [2]string{"0x0", "0x0"}
+	}
+
+	// Use original root for consistency with on-chain registration
 	copy(res.Root[:], root)
 
-	for i := 0; i < 32; i++ {
-		res.Inputs = append(res.Inputs, fmt.Sprintf("%d", root[i]))
-	}
-	for i := 0; i < 32; i++ {
-		res.Inputs = append(res.Inputs, fmt.Sprintf("%d", txHash[i]))
+	// Extract public inputs from witness vector for correct ordering
+	pubWitness, _ := fullWitness.Public()
+	vec := pubWitness.Vector().(fr.Vector)
+	res.Inputs = make([]string, 0, len(vec))
+	for i := 0; i < len(vec); i++ {
+		v := vec[i].BigInt(new(big.Int))
+		res.Inputs = append(res.Inputs, v.String())
 	}
 
 	res.LockID = lockID
 	res.Amount = amountStr
 	res.Destination = ethDest
-
-	// Append extra public inputs to Inputs slice for Solidity verifier
-	// LockID
-	res.Inputs = append(res.Inputs, strconv.FormatUint(lockID, 10))
-
-	// Amount
-	res.Inputs = append(res.Inputs, amountStr)
-
-	// Destination (20 bytes, each as a uint256 input)
-	for i := 0; i < 20; i++ {
-		res.Inputs = append(res.Inputs, fmt.Sprintf("%d", ethDestBytes[i]))
-	}
 
 	return res, nil
 }

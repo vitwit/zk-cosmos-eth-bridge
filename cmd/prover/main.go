@@ -17,7 +17,7 @@ func main() {
 
 	rpcURL := os.Args[1]
 	height, _ := strconv.ParseInt(os.Args[2], 10, 64)
-	txHashStr := os.Args[3]
+	txIndex, _ := strconv.Atoi(os.Args[3])
 	lockID, _ := strconv.ParseUint(os.Args[4], 10, 64)
 	amountStr := os.Args[5]
 	ethDest := os.Args[6]
@@ -27,7 +27,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	proof, err := p.GenerateInclusionProof(rpcURL, height, txHashStr, lockID, amountStr, ethDest)
+	proof, err := p.GenerateInclusionProof(rpcURL, height, txIndex, lockID, amountStr, ethDest)
 	if err != nil {
 		log.Fatal(err)
 	}
