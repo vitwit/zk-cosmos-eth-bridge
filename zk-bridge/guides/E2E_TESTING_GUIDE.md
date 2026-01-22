@@ -18,13 +18,13 @@ This guide explains how to test the complete ZK-bridge flow, from locking tokens
 
 ```bash
 cd zk-bridge
-go run cmd/compiler/main.go
+go run cmd/setup/main.go
 ```
 
 This generates:
 - `keys/proving.key` - Required for proof generation (~450MB)
 - `keys/verifying.key` - Verification key
-- `contracts/Verifier.sol` - Solidity verifier with SHA256 patch
+- `contracts/Verifier.sol` - Solidity verifier with **Keccak256** native commitment support
 
 ### B. Deploy BridgeSource on Cosmos (via Remix)
 
@@ -189,8 +189,8 @@ Successful transactions will show `"status": "0x1"`.
 
 **Option 3: Using Cast**
 ```bash
-cast call $BRIDGE_DEST_ADDR "balanceOf(address)" 0xRECIPIENT_ADDRESS \
-  --rpc-url $ETHEREUM_RPC_URL
+# Returns balance in decimal format by piping to cast --to-dec
+cast --to-dec $(cast call $BRIDGE_DEST_ADDR "balanceOf(address)" 0xRECIPIENT_ADDRESS --rpc-url $ETHEREUM_RPC_URL)
 ```
 
 ---
@@ -200,7 +200,7 @@ cast call $BRIDGE_DEST_ADDR "balanceOf(address)" 0xRECIPIENT_ADDRESS \
 ### Proof Generation Fails
 
 **Error: `proving.key not found`**
-- **Solution**: Run `go run cmd/compiler/main.go` first to generate keys
+- **Solution**: Run `go run cmd/setup/main.go` first to generate keys
 - **Verify**: Check that `keys/proving.key` exists (should be ~450MB)
 
 **Error: `Merkle proof data invalid`**
@@ -214,7 +214,7 @@ cast call $BRIDGE_DEST_ADDR "balanceOf(address)" 0xRECIPIENT_ADDRESS \
 - **Cause**: Mismatch between proving key and deployed Verifier
 - **Solution**: 
   1. Delete old `keys/` directory
-  2. Run `go run cmd/compiler/main.go` to regenerate
+  2. Run `go run cmd/setup/main.go` to regenerate
   3. Redeploy `Verifier.sol` and `BridgeDestination.sol`
   4. Update `.env` with new addresses
 
@@ -332,7 +332,7 @@ rm -rf keys/
 rm proof_event.json
 
 # Regenerate everything
-go run cmd/compiler/main.go
+go run cmd/setup/main.go
 
 # Redeploy all contracts
 # Update .env

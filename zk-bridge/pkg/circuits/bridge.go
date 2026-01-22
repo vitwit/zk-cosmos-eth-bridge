@@ -13,19 +13,16 @@ const MerkleDepth = 32 // Production-ready depth for Tendermint tx trees
 // in a Merkle tree with a specific root.
 type ZkBridgeCircuit struct {
 	// Public inputs (Visible to Ethereum)
-	// We pack 32 bytes into 4 x uint64 variables to save gas and avoid GNARK commitment complexity.
 	PackedRoot   [4]frontend.Variable `gnark:",public"`
 	PackedTxHash [4]frontend.Variable `gnark:",public"`
 
 	// Private inputs (Hidden from Ethereum)
 	ProofPath   [MerkleDepth][32]frontend.Variable
 	ProofHelper [MerkleDepth]frontend.Variable
-	ActualDepth frontend.Variable
+	ActualDepth frontend.Variable `gnark:",secret"`
 }
 
 func (c *ZkBridgeCircuit) Define(api frontend.API) error {
-	uapi, _ := uints.NewBytes(api)
-
 	// 1. Unpack Root and TxHash into bytes
 	rootBytes := c.unpack(api, c.PackedRoot)
 	txHashBytes := c.unpack(api, c.PackedTxHash)
@@ -36,42 +33,40 @@ func (c *ZkBridgeCircuit) Define(api frontend.API) error {
 		currentHash[j] = txHashBytes[j]
 	}
 
-	// 3. Reconstruct Merkle Root from path using Tendermint InnerHash logic:
-	// InnerHash(L, R) = SHA256(0x01 || L || R)
-	//
-	// SPECIAL CASE: If ActualDepth == 0 (single transaction in block),
-	// then root == leaf, so we skip the Merkle hashing loop entirely.
+	// 3. Reconstruct Merkle Root from path
 	for i := 0; i < MerkleDepth; i++ {
+		isActive := cmp.IsLess(api, i, c.ActualDepth)
+
+		// Gating the SHA write to avoid padding constraint failures on dummy data
 		sha, _ := sha2.New(api)
 
-		// Tendermint Inner Node Prefix: 0x01
-		sha.Write([]uints.U8{uints.NewU8(1)})
+		prefix := api.Select(isActive, 1, 0)
+		sha.Write([]uints.U8{{Val: prefix}})
 
 		left := make([]uints.U8, 32)
 		right := make([]uints.U8, 32)
 
 		for j := 0; j < 32; j++ {
 			pathByte := uints.U8{Val: c.ProofPath[i][j]}
-			// ProofHelper[i] == 1 means currentHash is on the right
-			left[j] = uapi.Select(c.ProofHelper[i], pathByte, currentHash[j])
-			right[j] = uapi.Select(c.ProofHelper[i], currentHash[j], pathByte)
+			left[j].Val = api.Select(c.ProofHelper[i], pathByte.Val, currentHash[j].Val)
+			right[j].Val = api.Select(c.ProofHelper[i], currentHash[j].Val, pathByte.Val)
+
+			// Masking inputs to keep SHA state consistent
+			left[j].Val = api.Select(isActive, left[j].Val, 0)
+			right[j].Val = api.Select(isActive, right[j].Val, 0)
 		}
 
 		sha.Write(left)
 		sha.Write(right)
 		res := sha.Sum()
 
-		// If i < ActualDepth, update currentHash.
-		// This means when ActualDepth == 0, currentHash stays as the leaf (no hashing)
-		isActive := cmp.IsLess(api, i, c.ActualDepth)
+		// Update currentHash only if isActive is true
 		for j := 0; j < 32; j++ {
 			currentHash[j].Val = api.Select(isActive, res[j].Val, currentHash[j].Val)
 		}
 	}
 
-	// 4. Assert the reconstructed root matches the public Root
-	// When ActualDepth == 0: currentHash == txHashBytes == rootBytes (single tx case)
-	// When ActualDepth > 0: currentHash == computed Merkle root
+	// 4. Assert correctness
 	for j := 0; j < 32; j++ {
 		api.AssertIsEqual(currentHash[j].Val, rootBytes[j].Val)
 	}

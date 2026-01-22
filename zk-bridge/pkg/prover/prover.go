@@ -12,8 +12,10 @@ import (
 	"strings"
 
 	"github.com/consensys/gnark-crypto/ecc"
+	"github.com/consensys/gnark/backend"
 	"github.com/consensys/gnark/backend/groth16"
 	gnark_bn254 "github.com/consensys/gnark/backend/groth16/bn254"
+	"github.com/consensys/gnark/backend/solidity"
 	"github.com/consensys/gnark/frontend"
 	"github.com/consensys/gnark/frontend/cs/r1cs"
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -144,13 +146,13 @@ func GenerateProof(cosmosRpcUrl string, txHashHex string, outputPath string) ([3
 	publicWitness, _ := fullWitness.Public()
 
 	fmt.Println("🚀 Step 4/4: Calculating ZK-SNARK Proof...")
-	proof, err := groth16.Prove(ccs, pk, fullWitness)
+	proof, err := groth16.Prove(ccs, pk, fullWitness, solidity.WithProverTargetSolidityVerifier(backend.GROTH16))
 	if err != nil {
 		return root, tx, err
 	}
 
 	fmt.Println("✅ Proof generated locally.")
-	if err := groth16.Verify(proof, vk, publicWitness); err != nil {
+	if err := groth16.Verify(proof, vk, publicWitness, solidity.WithVerifierTargetSolidityVerifier(backend.GROTH16)); err != nil {
 		return root, tx, fmt.Errorf("local verification failed: %v", err)
 	}
 

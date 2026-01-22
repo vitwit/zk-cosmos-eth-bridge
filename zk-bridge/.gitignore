@@ -2,15 +2,25 @@
 keys/
 build/
 .env
+proof_event.json
 
 # Go
 vendor/
+go.mod.bak
+go.sum.bak
 go.work
 
 # Compiled binaries
-/*compiler
 /*relayer
 /*deployer
+/*setup
+
+# ZK/Debug
+trace.txt
+full_trace.txt
+diagnostic_output.txt
+DebugVerifier.sol
+TestVerifier.sol
 
 # Misc
 *.log
