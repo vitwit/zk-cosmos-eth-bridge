@@ -66,4 +66,14 @@ contract MintBridge {
         token.mint(_to, _amount);
         emit Mint(_to, _amount, _txHash);
     }
+
+    event Burned(address indexed sender, uint256 amount, string recipient);
+
+    function burn(uint256 amount, string calldata recipient) external {
+        // Use burnFrom to burn tokens directly from user's wallet
+        // This requires the user to have approved this contract
+        token.burnFrom(msg.sender, amount);
+        
+        emit Burned(msg.sender, amount, recipient);
+    }
 }
