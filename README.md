@@ -2,6 +2,9 @@
 
 A Zero-Knowledge proof-based bridge infrastructure for cross-chain communication between Cosmos-based EVM chains and Ethereum.
 
+> [!WARNING]
+> This project is a **Proof of Concept (POC)** and is **not production-ready**. It is intended for demonstration and testing purposes only.
+
 ## Overview
 
 This repository contains two main components:
