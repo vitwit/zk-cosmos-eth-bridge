@@ -1,28 +1,30 @@
 # Keys and Artifacts
-keys/
 build/
+keys/
 .env
 proof_event.json
 Verifier.sol
 
 # Go
 vendor/
-go.mod.bak
-go.sum.bak
 go.work
+*.bak
 
-# Compiled binaries
-/*relayer
-/*deployer
-/*setup
+# Compiled Binaries
+/relayer
+/main
+/setup
+
+# Foundry
+/out
+/cache
 
 # ZK/Debug
 trace.txt
 full_trace.txt
 diagnostic_output.txt
-DebugVerifier.sol
-TestVerifier.sol
 
 # Misc
 *.log
 .DS_Store
+last_eth_block.txt

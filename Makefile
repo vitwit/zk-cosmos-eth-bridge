@@ -81,7 +81,7 @@ ifneq (,$(findstring nooptimization,$(COSMOS_BUILD_OPTIONS)))
 endif
 
 # Build into $(BUILDDIR)
-build: go.sum $(BUILDDIR)/
+build: $(EVMD_DIR)/go.sum $(BUILDDIR)/
 	@echo "🏗️  Building evmd to $(BUILDDIR)/$(EXAMPLE_BINARY) ..."
 	@cd $(EVMD_DIR) && CGO_ENABLED="1" \
 	  go build $(BUILD_FLAGS) -o $(BUILDDIR)/$(EXAMPLE_BINARY) $(EVMD_MAIN_PKG)
@@ -91,7 +91,7 @@ build-linux:
 	GOOS=linux GOARCH=amd64 $(MAKE) build
 
 # Install into $(BINDIR)
-install: go.sum
+install: $(EVMD_DIR)/go.sum
 	@echo "🚚  Installing evmd to $(BINDIR) ..."
 	@cd $(EVMD_DIR) && CGO_ENABLED="1" \
 	  go install $(BUILD_FLAGS) $(EVMD_MAIN_PKG)

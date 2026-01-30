@@ -9,7 +9,7 @@ import (
 	"github.com/consensys/gnark/backend/solidity"
 	"github.com/consensys/gnark/frontend"
 	"github.com/consensys/gnark/frontend/cs/r1cs"
-	"github.com/vitwit/zk-cosmos-eth-bridge/zk-bridge/pkg/circuits"
+	"github.com/vitwit/zk-cosmos-eth-bridge/bridge/pkg/circuits"
 	"golang.org/x/crypto/sha3"
 )
 

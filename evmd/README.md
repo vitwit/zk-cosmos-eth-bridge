@@ -27,7 +27,7 @@ By default, this chain has the following configuration:
 To run the example, execute the local node script found within this repository:
 
 ```bash
-./local_node.sh [FLAGS]
+./local_evm_node.sh [FLAGS]
 ```
 
 Available flags are:

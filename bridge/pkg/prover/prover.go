@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math/big"
@@ -23,8 +22,8 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
-	"github.com/vitwit/zk-cosmos-eth-bridge/zk-bridge/pkg/circuits"
-	"github.com/vitwit/zk-cosmos-eth-bridge/zk-bridge/pkg/rpc"
+	"github.com/vitwit/zk-cosmos-eth-bridge/bridge/pkg/circuits"
+	"github.com/vitwit/zk-cosmos-eth-bridge/bridge/pkg/rpc"
 )
 
 // GenerateProof fetches real data from Cosmos RPC and generates a SNARK proof.
@@ -200,8 +199,8 @@ func GenerateProof(cosmosRpcUrl string, txHashHex string, outputPath string) ([3
 	return root, tx, os.WriteFile(outputPath, out, 0o644)
 }
 
-// SubmitProof automatically sends the ZK-SNARK proof to the BridgeDestination contract.
-func SubmitProof(ethRpcUrl string, privKeyHex string, bridgeAddr string, recipient string, amount *big.Int, root [32]byte, txHash [32]byte, proofPath string) error {
+// SubmitProof automatically sends the ZK-SNARK proof to the EthBridge contract.
+func SubmitProof(ethRpcUrl string, privKeyHex string, bridgeAddr string, recipient string, amount *big.Int, root [32]byte, txHash [32]byte, proofPath string, isMint bool) error {
 	client, err := ethclient.Dial(ethRpcUrl)
 	if err != nil {
 		return err
@@ -247,39 +246,50 @@ func SubmitProof(ethRpcUrl string, privKeyHex string, bridgeAddr string, recipie
 		}
 	}
 
-	// Updated ABI to include commitments and commitmentPok
-	abiJSON := `[{"inputs":[{"internalType":"uint256[2]","name":"a","type":"uint256[2]"},{"internalType":"uint256[2][2]","name":"b","type":"uint256[2][2]"},{"internalType":"uint256[2]","name":"c","type":"uint256[2]"},{"internalType":"uint256[2]","name":"commitments","type":"uint256[2]"},{"internalType":"uint256[2]","name":"commitmentPok","type":"uint256[2]"},{"internalType":"bytes32","name":"root","type":"bytes32"},{"internalType":"bytes32","name":"lockTxHash","type":"bytes32"},{"internalType":"address","name":"recipient","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"mint","outputs":[],"stateMutability":"nonpayable","type":"function"}]`
+	methodName := "mint"
+	paramName := "lockTxHash"
+	if !isMint {
+		methodName = "unlock"
+		paramName = "burnTxHash"
+	}
+
+	abiJSON := fmt.Sprintf(`[{"inputs":[{"internalType":"uint256[2]","name":"a","type":"uint256[2]"},{"internalType":"uint256[2][2]","name":"b","type":"uint256[2][2]"},{"internalType":"uint256[2]","name":"c","type":"uint256[2]"},{"internalType":"uint256[2]","name":"commitments","type":"uint256[2]"},{"internalType":"uint256[2]","name":"commitmentPok","type":"uint256[2]"},{"internalType":"bytes32","name":"root","type":"bytes32"},{"internalType":"bytes32","name":"%s","type":"bytes32"},{"internalType":"address","name":"recipient","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"%s","outputs":[],"stateMutability":"nonpayable","type":"function"}]`, paramName, methodName)
 	parsedABI, _ := abi.JSON(strings.NewReader(abiJSON))
 	contract := bind.NewBoundContract(common.HexToAddress(bridgeAddr), parsedABI, client, client, client)
 
-	tx, err := contract.Transact(auth, "mint", a, b, c, commits, pok, root, txHash, common.HexToAddress(recipient), amount)
+	tx, err := contract.Transact(auth, methodName, a, b, c, commits, pok, root, txHash, common.HexToAddress(recipient), amount)
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("🚀 ZK-SNARK Proof submitted! Hash: %s\n", tx.Hash().Hex())
+	fmt.Printf("🚀 ZK-SNARK Proof submitted! Method=%s, Hash: %s\n", methodName, tx.Hash().Hex())
 	return nil
 }
 
-func FetchLockDetails(evmRpcUrl string, bridgeAddr string, txHashHex string) (string, *big.Int, error) {
+func FetchLockDetails(evmRpcUrl string, bridgeAddr string, txHashHex string) (string, *big.Int, bool, error) {
 	client, err := ethclient.Dial(evmRpcUrl)
 	if err != nil {
-		return "", nil, err
+		return "", nil, false, err
 	}
 	receipt, err := client.TransactionReceipt(context.Background(), common.HexToHash(txHashHex))
 	if err != nil {
-		return "", nil, err
+		return "", nil, false, err
 	}
 
-	lockEventSig := "b66dadac3190736ac970c9235fdd04d595fcd77865ef1f207f8cd3145165a324"
+	lockEventSig := crypto.Keccak256Hash([]byte("Lock(address,uint256,address,uint256)")).Hex()
+	burnEventSig := crypto.Keccak256Hash([]byte("Burn(address,uint256,address,uint256)")).Hex()
+
 	for _, vLog := range receipt.Logs {
-		if hex.EncodeToString(vLog.Topics[0].Bytes()) == lockEventSig && vLog.Address == common.HexToAddress(bridgeAddr) {
+		logSig := vLog.Topics[0].Hex()
+		logAddr := vLog.Address.Hex()
+
+		if (logSig == lockEventSig || logSig == burnEventSig) && strings.EqualFold(logAddr, bridgeAddr) {
 			amount := new(big.Int).SetBytes(vLog.Data[0:32])
 			recipientAddressed := common.BytesToAddress(vLog.Data[32:64])
-			return recipientAddressed.Hex(), amount, nil
+			return recipientAddressed.Hex(), amount, (logSig == lockEventSig), nil
 		}
 	}
-	return "", nil, fmt.Errorf("lock event not found")
+	return "", nil, false, fmt.Errorf("lock or burn event not found")
 }
 
 func UpdateRoot(ethRpcUrl string, privKeyHex string, bridgeAddr string, newRoot [32]byte) error {
@@ -301,4 +311,111 @@ func UpdateRoot(ethRpcUrl string, privKeyHex string, bridgeAddr string, newRoot 
 	fmt.Printf("🔄 Root update submitted. Hash: %s\n", tx.Hash().Hex())
 	_, err = bind.WaitMined(context.Background(), client, tx)
 	return err
+}
+
+// FetchEthLockDetails extracts details from an Ethereum Bridge event.
+func FetchEthLockDetails(ethRpcUrl string, bridgeAddr string, txHashHex string) (string, *big.Int, bool, error) {
+	client, err := ethclient.Dial(ethRpcUrl)
+	if err != nil {
+		return "", nil, false, err
+	}
+	receipt, err := client.TransactionReceipt(context.Background(), common.HexToHash(txHashHex))
+	if err != nil {
+		return "", nil, false, err
+	}
+
+	// event Locked(address indexed sender, uint256 amount, string cosmosRecipient, uint256 nonce);
+	lockEventSig := crypto.Keccak256Hash([]byte("Locked(address,uint256,string,uint256)")).Hex()
+	burnEventSig := crypto.Keccak256Hash([]byte("Burned(address,uint256,string,uint256)")).Hex()
+
+	for _, vLog := range receipt.Logs {
+		logSig := vLog.Topics[0].Hex()
+		logAddr := vLog.Address.Hex()
+
+		if (logSig == lockEventSig || logSig == burnEventSig) && strings.EqualFold(logAddr, bridgeAddr) {
+			// Layout:
+			// [0:32]   amount
+			// [32:64]  offset to string data (usually 96)
+			// [64:96]  nonce
+			// [96:128] string length
+			// [128:]   string data
+
+			if len(vLog.Data) < 128 {
+				continue
+			}
+
+			amount := new(big.Int).SetBytes(vLog.Data[0:32])
+
+			// Extract string data using the offset and length
+			strOffset := new(big.Int).SetBytes(vLog.Data[32:64]).Uint64()
+			strLen := new(big.Int).SetBytes(vLog.Data[strOffset : strOffset+32]).Uint64()
+
+			if uint64(len(vLog.Data)) < strOffset+32+strLen {
+				return "", nil, false, fmt.Errorf("malformed event data: string out of bounds")
+			}
+
+			recipient := string(vLog.Data[strOffset+32 : strOffset+32+strLen])
+			return recipient, amount, (logSig == lockEventSig), nil
+		}
+	}
+	return "", nil, false, fmt.Errorf("ethereum event not found")
+}
+
+// UpdateEthRootOnCosmos updates the Ethereum trust anchor on the Cosmos bridge contract.
+func UpdateEthRootOnCosmos(cosmosRpcUrl string, privKeyHex string, bridgeAddr string, newRoot [32]byte) error {
+	client, err := ethclient.Dial(cosmosRpcUrl)
+	if err != nil {
+		return err
+	}
+	privateKey, _ := crypto.HexToECDSA(privKeyHex)
+	chainID, _ := client.ChainID(context.Background())
+	auth, _ := bind.NewKeyedTransactorWithChainID(privateKey, chainID)
+
+	abiJSON := `[{"inputs":[{"internalType":"bytes32","name":"_newRoot","type":"bytes32"}],"name":"updateTrustedEthRoot","outputs":[],"stateMutability":"nonpayable","type":"function"}]`
+	parsedABI, _ := abi.JSON(strings.NewReader(abiJSON))
+	contract := bind.NewBoundContract(common.HexToAddress(bridgeAddr), parsedABI, client, client, client)
+	tx, err := contract.Transact(auth, "updateTrustedEthRoot", newRoot)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("🔄 Eth Root synced to Cosmos. Hash: %s\n", tx.Hash().Hex())
+	_, err = bind.WaitMined(context.Background(), client, tx)
+	return err
+}
+
+// SubmitEthProofToCosmos submits the MPT proof to the Cosmos bridge contract to mint/unlock assets.
+func SubmitEthProofToCosmos(cosmosRpcUrl string, privKeyHex string, bridgeAddr string, recipient string, amount *big.Int, ethTxHash [32]byte, key []byte, proof [][]byte, isMint bool) error {
+	client, err := ethclient.Dial(cosmosRpcUrl)
+	if err != nil {
+		return err
+	}
+
+	privateKey, _ := crypto.HexToECDSA(privKeyHex)
+	chainID, _ := client.ChainID(context.Background())
+	auth, _ := bind.NewKeyedTransactorWithChainID(privateKey, chainID)
+
+	methodName := "mint"
+	if !isMint {
+		methodName = "unlock"
+	}
+
+	// abi for mint/unlock(address recipient, uint256 amount, bytes32 ethTxHash, bytes memory key, bytes[] memory mptProof)
+	abiJSON := fmt.Sprintf(`[{"inputs":[{"internalType":"address","name":"recipient","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"},{"internalType":"bytes32","name":"ethTxHash","type":"bytes32"},{"internalType":"bytes","name":"key","type":"bytes"},{"internalType":"bytes[]","name":"mptProof","type":"bytes[]"}],"name":"%s","outputs":[],"stateMutability":"nonpayable","type":"function"}]`, methodName)
+	parsedABI, _ := abi.JSON(strings.NewReader(abiJSON))
+	contract := bind.NewBoundContract(common.HexToAddress(bridgeAddr), parsedABI, client, client, client)
+
+	fmt.Printf("🚀 MPT Proof submission details:\n")
+	fmt.Printf("  ├─ Target Key: %x\n", key)
+	fmt.Printf("  ├─ Proof Nodes Count: %d\n", len(proof))
+	for i, n := range proof {
+		fmt.Printf("  │  └─ Node[%d]: %d bytes, Hash: %s\n", i, len(n), crypto.Keccak256Hash(n).Hex())
+	}
+
+	tx, err := contract.Transact(auth, methodName, common.HexToAddress(recipient), amount, ethTxHash, key, proof)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("🚀 MPT Proof submitted to Cosmos! Method=%s, Hash: %s\n", methodName, tx.Hash().Hex())
+	return nil
 }

@@ -7,7 +7,7 @@ import (
 
 	"github.com/consensys/gnark-crypto/ecc"
 	"github.com/consensys/gnark/test"
-	"github.com/vitwit/zk-cosmos-eth-bridge/zk-bridge/pkg/circuits"
+	"github.com/vitwit/zk-cosmos-eth-bridge/bridge/pkg/circuits"
 )
 
 func TestZkBridgeCircuit_Inclusion_Depth32(t *testing.T) {
