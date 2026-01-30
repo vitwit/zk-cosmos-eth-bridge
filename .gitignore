@@ -28,11 +28,11 @@ go.work.sum
 .env
 
 # Editor/IDE
-# .idea/
-# .vscode/
+.idea/
+.vscode/
 
-# Build files
+# Build and Data files
 evmd/build/
-
 build/
 data/
+keys/
