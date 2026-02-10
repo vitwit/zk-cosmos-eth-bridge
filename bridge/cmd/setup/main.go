@@ -14,30 +14,56 @@ import (
 )
 
 func main() {
-	fmt.Println("🔨 Compiling...")
-	ccs, _ := frontend.Compile(ecc.BN254.ScalarField(), r1cs.NewBuilder, &circuits.ZkBridgeCircuit{})
-
-	fmt.Println("🔐 ONE-TIME SETUP...")
-	pk, vk, _ := groth16.Setup(ccs)
-
 	_ = os.MkdirAll("keys", 0o755)
 	_ = os.MkdirAll("contracts", 0o755)
 
-	fmt.Println("💾 Saving keys and CCS...")
-	f0, _ := os.Create("keys/circuit.ccs")
-	ccs.WriteTo(f0)
-	f0.Close()
-	f1, _ := os.Create("keys/proving.key")
-	pk.WriteTo(f1)
-	f1.Close()
-	f2, _ := os.Create("keys/verifying.key")
-	vk.WriteTo(f2)
-	f2.Close()
+	fmt.Printf("🔨 Compiling circuits with MaxValidators = %d...\n", circuits.MaxValidators)
 
-	fmt.Println("📜 Exporting Solidity...")
-	f3, _ := os.Create("contracts/Verifier.sol")
-	vk.ExportSolidity(f3, solidity.WithHashToFieldFunction(sha3.NewLegacyKeccak256()))
-	f3.Close()
+	// 1. Transaction Inclusion Circuit
+	setupCircuit("Transactions", &circuits.ZkBridgeCircuit{})
 
-	fmt.Println("✨ Setup complete. Do NOT run this again unless circuit changes.")
+	// 2. Validator Finality Circuit
+	valCirc := &circuits.ValidatorCircuit{}
+	valCirc.AllocateSlices()
+	setupCircuit("Validators", valCirc)
+
+	// 3. Valset Transition Circuit
+	transCirc := &circuits.TransitionCircuit{}
+	transCirc.AllocateSlices()
+	setupCircuit("Transitions", transCirc)
+
+	fmt.Println("✨ Production setup complete. Keys and Verifiers generated.")
+}
+
+func setupCircuit(name string, circuit frontend.Circuit) {
+	fmt.Printf("📦 Setting up %s Circuit...\n", name)
+
+	ccs, err := frontend.Compile(ecc.BN254.ScalarField(), r1cs.NewBuilder, circuit)
+	if err != nil {
+		fmt.Printf("❌ Failed to compile %s: %v\n", name, err)
+		return
+	}
+
+	pk, vk, err := groth16.Setup(ccs)
+	if err != nil {
+		fmt.Printf("❌ Failed setup for %s: %v\n", name, err)
+		return
+	}
+
+	// Save Proving Key
+	pkFile, _ := os.Create(fmt.Sprintf("keys/%s.proving.key", name))
+	pk.WriteTo(pkFile)
+	pkFile.Close()
+
+	// Save Verifying Key
+	vkFile, _ := os.Create(fmt.Sprintf("keys/%s.verifying.key", name))
+	vk.WriteTo(vkFile)
+	vkFile.Close()
+
+	// Export Solidity Verifier
+	solFile, _ := os.Create(fmt.Sprintf("contracts/Verifier_%s.sol", name))
+	vk.ExportSolidity(solFile, solidity.WithHashToFieldFunction(sha3.NewLegacyKeccak256()))
+	solFile.Close()
+
+	fmt.Printf("✅ %s setup complete.\n", name)
 }

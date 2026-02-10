@@ -1,4 +1,4 @@
-package circuits_test
+package circuits
 
 import (
 	"encoding/binary"
@@ -7,14 +7,13 @@ import (
 
 	"github.com/consensys/gnark-crypto/ecc"
 	"github.com/consensys/gnark/test"
-	"github.com/vitwit/zk-cosmos-eth-bridge/bridge/pkg/circuits"
 )
 
 // TestZkBridgeCircuit_SimplePacking tests the circuit with simple packing logic
 // that matches how the prover packs data (binary.BigEndian.Uint64)
 func TestZkBridgeCircuit_SimplePacking(t *testing.T) {
 	assert := test.NewAssert(t)
-	var circuit circuits.ZkBridgeCircuit
+	var circuit ZkBridgeCircuit
 
 	// Create simple test data
 	var root [32]byte
@@ -27,7 +26,7 @@ func TestZkBridgeCircuit_SimplePacking(t *testing.T) {
 	}
 
 	// Pack using binary.BigEndian (same as prover)
-	witness := circuits.ZkBridgeCircuit{}
+	witness := ZkBridgeCircuit{}
 	for i := 0; i < 4; i++ {
 		witness.PackedRoot[i] = binary.BigEndian.Uint64(root[i*8 : (i+1)*8])
 		witness.PackedTxHash[i] = binary.BigEndian.Uint64(txHash[i*8 : (i+1)*8])
@@ -37,7 +36,7 @@ func TestZkBridgeCircuit_SimplePacking(t *testing.T) {
 	witness.ActualDepth = big.NewInt(0)
 
 	// Initialize proof arrays (all zeros since depth=0)
-	for i := 0; i < circuits.MerkleDepth; i++ {
+	for i := 0; i < MerkleDepth; i++ {
 		for j := 0; j < 32; j++ {
 			witness.ProofPath[i][j] = big.NewInt(0)
 		}

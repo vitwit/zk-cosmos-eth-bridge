@@ -9,9 +9,9 @@ This guide details how to verify the bidirectional bridge functionality using st
 go run cmd/setup/main.go
 ```
 This generates:
-- `keys/proving.key`: Required by the relayer for GROTH16 proof generation.
-- `keys/verifying.key`: Used for local verification checks.
-- `contracts/Verifier.sol`: The Solidity contract that MUST be deployed to Ethereum.
+- `keys/*.proving.key`: Required by the relayer for each of the three circuits.
+- `keys/*.verifying.key`: Used for local verification checks.
+- `contracts/Verifier_*.sol`: Three specialized verifier contracts (Transactions, Validators, Transitions).
 
 ---
 
@@ -35,17 +35,22 @@ Before any bridge operations, ensure your local environment is active:
 
 Before running the relayer, you must deploy the gateways to both chains.
 
-### A. Deploy Verifier (Ethereum)
+### A. Deploy Verifiers (Ethereum)
 ```bash
-forge create --rpc-url $ETHEREUM_RPC --private-key $USER_KEY contracts/Verifier.sol:Verifier
+forge create --rpc-url $ETHEREUM_RPC --private-key $USER_KEY contracts/Verifier_Transactions.sol:Verifier
+forge create --rpc-url $ETHEREUM_RPC --private-key $USER_KEY contracts/Verifier_Validators.sol:Verifier
+forge create --rpc-url $ETHEREUM_RPC --private-key $USER_KEY contracts/Verifier_Transitions.sol:Verifier
 ```
-**Record address**: `$VERIFIER_ADDR`
+**Record addresses**: `$TX_VERIFIER`, `$VAL_VERIFIER`, `$TRANS_VERIFIER`
 
 ### B. Deploy EthBridge (Ethereum)
-Requires initial Cosmos root and verifier address:
+Requires initial Cosmos validator set and verifier addresses:
 ```bash
-export ROOT=$(curl -s $COSMOS_RPC/block | jq -r '.result.block.header.data_hash' | xargs -I {} echo 0x{})
-forge create --rpc-url $ETHEREUM_RPC --private-key $USER_KEY contracts/EthBridge.sol:EthBridge --constructor-args $VERIFIER_ADDR $ROOT
+export VAL_SET=$(curl -s $COSMOS_RPC/block | jq -r '.result.block.header.validators_hash' | xargs -I {} echo 0x{})
+export HEIGHT=$(curl -s $COSMOS_RPC/status | jq -r '.result.sync_info.latest_block_height')
+
+forge create --rpc-url $ETHEREUM_RPC --private-key $USER_KEY contracts/EthBridge.sol:EthBridge \
+  --constructor-args $TX_VERIFIER $VAL_VERIFIER $TRANS_VERIFIER $VAL_SET $HEIGHT
 ```
 **Record address**: `$ETH_BRIDGE_ADDR`
 
@@ -72,7 +77,7 @@ go run cmd/relayer/main.go
 
 ## 4. Test Flow 1: Cosmos → Ethereum (ZK-SNARK)
 
-**Goal**: Proof-of-Concept for locking native tokens on Cosmos and minting wrapped tokens on Ethereum using ZK-SNARKs.
+**Goal**: Securely lock native tokens on Cosmos and mint wrapped tokens on Ethereum using ZK-SNARKs.
 
 ### Step 1: Initiate Lock on Cosmos
 ```bash
@@ -99,7 +104,7 @@ cast call $BRIDGE_ETH_ADDR "balanceOf(address)" $ETH_RECIPIENT \
 
 ## 5. Test Flow 2: Ethereum → Cosmos (MPT-Proof)
 
-**Goal**: Proof-of-Concept for locking native ETH on Ethereum and minting wrapped tokens on Cosmos using MPT proofs.
+**Goal**: Securely lock native ETH on Ethereum and mint wrapped tokens on Cosmos using MPT proofs.
 
 ### Step 1: Initiate Lock on Ethereum
 ```bash
@@ -153,8 +158,8 @@ cast --to-checksum THE_COSMOS_BECH32_ADDRESS
 
 ### Check Contract State
 ```bash
-# Check Trusted Root on EthBridge
-cast call $BRIDGE_ETH_ADDR "trustedBlockRoot()(bytes32)" --rpc-url $ETH_RPC
+# Check Trusted Root on EthBridge for specific height
+cast call $BRIDGE_ETH_ADDR "trustedRoots(uint256)(bytes32)" $HEIGHT --rpc-url $ETH_RPC
 
 # Check Native Balance
 cast balance $ADDRESS --rpc-url $RPC_URL
@@ -186,12 +191,13 @@ The relayer is designed to handle multiple concurrent events. You can fire multi
 
 ---
 
-## 8. Trust Model & POC Limitations
+## 8. Trust Model & Future Roadmap
 
 **IMPORTANT**: This version implements **cryptographically verified payload inclusion** for both directions.
 
 - **On-Chain (Secure)**: 
-  - **Cosmos -> Eth**: Verified by `Verifier.sol` (ZK-SNARK).
+  - **Cosmos -> Eth**: Verified by triple-verifier suite (Transactions, Validators, Transitions). Block header consensus is cryptographically verified in-circuit.
   - **Eth -> Cosmos**: Verified by `LibMPT.sol` (MPT Proof) and `RLPReader.sol` (Receipt Decoding). Transaction data and event logs are strictly verified against the trusted root.
-- **Off-Chain (Administrative)**: Block header synchronization (Light Client logic) is handled by the **Relayer**. The contracts trust the relayer's administrative account to provide valid block roots.
-- **Production Upgrade**: Full decentralization requires implementing actual on-chain Light Clients to verify header consensus (Sync Committee/Tendermint signatures) before accepting root updates. This was deferred in the POC to focus on the high-complexity payload verification (ZK/MPT) and to avoid gas-heavy BLS signature checks in pure Solidity.
+- **Future Roadmap**:
+  - **On-Chain Light Clients**: For full decentralization, future upgrades will implement on-chain Light Clients to verify peer-chain consensus (e.g., Ethereum Sync Committees or Tendermint signatures) directly.
+  - **EVM-Light Client on Cosmos**: Implementing a native Ethereum light client module on Cosmos to verify Ethereum PoS headers without relying on relayer synchronization.

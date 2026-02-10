@@ -13,9 +13,11 @@ bridge/
 │   ├── CosmosBridge.sol   # Gateway on Cosmos EVM
 │   ├── EthBridge.sol      # Gateway on Ethereum
 │   ├── LibMPT.sol         # MPT verification library (for Eth -> Cosmos)
-│   └── Verifier.sol       # ZK verifier (for Cosmos -> Eth)
+│   ├── Verifier_Transactions.sol  # ZK Transaction Inclusion Verifier
+│   ├── Verifier_Validators.sol    # ZK Block Finality Verifier
+│   └── Verifier_Transitions.sol   # ZK Valset Transition Verifier
 ├── pkg/                   # Shared Go packages
-│   ├── circuits/          # GNARK ZK-SNARK definitions
+│   ├── circuits/          # GNARK ZK-SNARK definitions (Triple-Verifier)
 │   ├── prover/            # Proof generation (ZK & MPT)
 │   ├── rpc/               # Multi-chain RPC clients
 │   └── trie/              # MPT implementation for Go
@@ -43,56 +45,79 @@ The bridge facilitates the transfer of native assets and their wrapped counterpa
 This direction uses **Groth16 ZK-SNARKs** to verify Tendermint Merkle proofs on Ethereum.
 
 ### 3.1 Cryptographic Foundation
+- **Triple-Verifier Architecture**: The production implementation uses three specialized circuits to ensure security and gas efficiency:
+  - **ValidatorCircuit**: Verifies block finality using **Secp256k1 ECDSA** signatures and 2/3 voting power quorum.
+  - **TransitionCircuit**: Verifies validator set updates through signed set-hashes.
+  - **TransactionCircuit**: Verifies Merkle inclusion proofs for specific transactions.
+
+#### Why this approach?
+1. **Security (Trust Continuity)**: By separating validator set transitions into its own circuit, we ensure a "cryptographic chain of custody." A new validator set is only trusted if the *previous* trusted set signed its hash. This prevents "long-range attacks" where an attacker could otherwise try to inject a fake validator set.
+2. **Gas Efficiency (Amortization)**: 
+   - Signature verification (Secp156k1 emulation) is extremely expensive on-chain (~200k+ gas). 
+   - Instead of verifying signatures for *every* transaction, we verify them once (per block/epoch) to anchor a `trustedRoot`. 
+   - Individual transaction proofs then only need to verify a Merkle path against that root, which is significantly cheaper and faster inside a SNARK.
+3. **Modular Proving**: Separating circuits reduces the "constraint count" for each individual proof. This results in faster proof generation and lower memory requirements for the relayer/prover compared to a single "God Circuit."
+
 - **Proving System**: Groth16 (BN254 curve).
-- **Circuit Logic**: Verifies that a transaction is included in the `data_hash` (Merkle Root) of a Cosmos block header.
-- **Witness Reduction**: Uses **Pedersen Commitments** with a **Keccak256 transcript** to reduce public inputs, ensuring gas-efficient on-chain verification.
+- **Emulated Arithmetic**: Uses non-native emulated arithmetic to verify Secp256k1 signatures on the BN254 curve.
 - **Input Packing**: 32-byte hashes are split into 4x `uint64` to maintain compatibility between the SNARK field and EVM words.
 
 ### 3.2 Deep Dive: The ZK Process
 
-#### A. Merkle Tree Implementation (Tendermint Style)
-Tendermint uses a specific hashing scheme to prevent parity attacks (second-preimage attacks):
-- **Leaf Nodes**: Hashed as `SHA256(0x00 || data)`
-- **Internal Nodes**: Hashed as `SHA256(0x01 || left || right)`
-The circuit implements this exact logic to ensure compatibility with real Tendermint proofs.
+The production bridge uses three distinct circuits to minimize gas costs and maximize security.
 
-#### B. Circuit Logic: Variable-Depth Support
-The circuit is designed for a max depth of 32. To handle different proof lengths without revealing the exact depth or bloating the circuit:
-1. The circuit performs a constant 32 hash iterations.
-2. An `ActualDepth` private witness determines when hashing is "active".
-3. `api.Select` masks dummy inputs if the index exceeds `ActualDepth`.
+#### A. Block Finality (ValidatorCircuit)
+This circuit proves that a specific block header is cryptographically finalized by the Cosmos network.
+1. **Signature Emulation**: It uses **non-native emulated arithmetic** to verify **Secp256k1 ECDSA** signatures (from Tendermint validators) on the BN254 curve used by Ethereum.
+2. **Quorum Enforcement**: It iterates through the validator set and calculates `signedPower`. It asserts that `3 * signedPower >= 2 * TotalPower` (the standard 2/3 Tendermint quorum).
+3. **Set Integrity**: It hashes the entire validator set (Address + Power) and ensures it matches the public `ValidatorsHash` to prevent "fake" key substitution.
 
-#### C. Pedersen Commitments & Witness Reduction
-To save gas, we don't pass the Merkle Path as public inputs:
-- **Problem**: 32 levels of path data would cost millions in gas.
-- **Solution**: We treat path data as **private witnesses** and commit to them via Pedersen commitments.
-- **Alignment**: We use `Keccak256` for the commitment transcript, allowing the Solidity verifier to verify the commitment using the native `keccak256` opcode.
+#### B. Validator Set Transitions (TransitionCircuit)
+This circuit ensures a secure handover between validator sets.
+1. **Consistency**: It verifies that the "Old Set" hash matches the previously trusted state.
+2. **Authorization**: It proves that the *new* set hash was authorized (signed) by a 2/3 quorum of the *old* trusted set.
 
-#### D. Public Input Packing (4x uint64)
+#### C. Transaction Inclusion (ZkBridgeCircuit)
+This circuit proves that a specific `TxHash` exists within a confirmed block's `data_hash`.
+1. **Hashing Scheme**: It implements Tendermint-style SHA-256 hashing to prevent second-preimage attacks:
+   - Leaf Nodes: `SHA256(0x00 || data)`
+   - Internal Nodes: `SHA256(0x01 || left || right)`
+2. **Variable-Depth Support**: The circuit is built for a max depth of 32. It uses an `ActualDepth` witness and `api.Select` to mask hashing iterations for smaller trees without compromising privacy or increasing gas costs.
+
+#### D. Public Input Packing (Efficiency)
 EVM works with 256-bit words, but SNARKs often prefer smaller chunks to avoid field overflow.
-- A 32-byte hash (Root/TxHash) is split into four 64-bit unsigned integers.
-- `EthBridge.sol` implements `unpack` logic to reconstruct these values for the circuit.
+- **Unpacking**: 32-byte hashes (Root/TxHash) are split into four 64-bit integers on-chain. The circuit "unpacks" these using bitwise operations to reconstruct the original byte-arrays.
+- **Gas Savings**: This packing keeps the number of public inputs low, reducing the "pairing" operation costs in the Solidity verifier.
 
-#### E. Public Input Slots (8 Slots)
-The Solidity verifier receives 8 `uint256` inputs in order:
+#### E. Public Input Slots (Transactional)
+The `TransactionCircuit` verifier receives 8 `uint256` inputs in order:
 - `[0..3]`: **Merkle Root** (4x uint64)
 - `[4..7]`: **Transaction Hash** (4x uint64)
-The contract packs these dynamically from the 32-byte `bytes32` value before the `Verifier.sol` call.
+The `EthBridge.sol` packs these dynamically from the 32-byte `bytes32` values before the call.
+
+*Note: The Validator and Transition verifiers use different slot counts (10 and 8 respectively) to accommodate their specific cryptographic inputs.*
 
 ---
 
 ### 3.3 Ethereum Event Detection
-the relayer monitors the following `keccak256` topic hashes:
+The relayer monitors the following topic hashes on Ethereum to trigger the release of assets on Cosmos:
+
 | Event | Signature | Topic Hash (Hex) |
 |-------|-----------|------------------|
 | `Locked` | `Locked(address,uint256,string,uint256)` | `0xb754...` |
 | `Burned` | `Burned(address,uint256,string,uint256)` | `0xcd51...` |
 
 ---
+
+#### High-Level ZK Pipeline
 1. **Circuit**: Reconstructs the Merkle tree path using SHA256 (Tendermint-style hashing).
-2. **Commitment**: Prover commits to the private proof path.
-3. **On-Chain**: `EthBridge.sol` calls `Verifier.sol`, passing the root, txHash, and commitment evidence.
-4. **Finality**: Successfully verified proofs trigger the `mint` or `unlock` functions on Ethereum.
+2. **On-Chain**: `EthBridge.sol` calls the respective Verifier contracts (`Verifier_Validators` for headers, `Verifier_Transactions` for inclusion).
+3. **Finality**: Successfully verified header proofs update the `trustedRoots`, which then enable the `mint` or `unlock` functions once transaction proofs are verified against them.
+
+#### E. Technical Flow
+1. **Sync**: The relayer submits a header proof (`ValidatorCircuit`) to update the trusted block root on Ethereum.
+2. **Transition**: If validators change, a `TransitionCircuit` proof is submitted to update the `ValidatorsHash`.
+3. **Mint/Unlock**: Once the block root is anchored, specific `ZkBridgeCircuit` proofs are used to verify and process individual bridge transfers.
 
 ---
 
@@ -104,7 +129,7 @@ This direction uses **Merkle Patricia Trie (MPT)** verification, leveraging the 
 Instead of a ZK proof, the relayer provides a raw MPT inclusion proof extracted from the Ethereum transaction receipt.
 
 - **Storage**: The `CosmosBridge.sol` maintains a `trustedEthReceiptRoot` (the `receiptsRoot` of an Ethereum block).
-- **Verified Inclusion**: All **bridge payloads are cryptographically verified on-chain**.
+- **Verified Inclusion**: Unlike the previous POC version, **payloads are now cryptographically verified on-chain**.
 - **Library**: `LibMPT.sol` implements actual Merkle Patricia Trie traversal (Branch, Extension, Leaf nodes) and Keccak256 hash-chain verification.
 - **Decoding**: `RLPReader.sol` is used to decode the Ethereum receipt, ensuring the `Locked` or `Burned` event signature and emitter address are valid before minting/unlocking assets.
 - **Node Hashing**: Every intermediate hash in the proof MUST match the child pointer of the previous node, starting from the `trustedEthRoot`.
@@ -175,17 +200,16 @@ sequenceDiagram
 ## 5. Key Design Decisions
 
 ### 5.1 Keccak256 Alignment
-To avoid "cross-chain friction," the Go prover and Solidity contracts are strictly aligned on Keccak256. This is especially critical for the ZK-SNARK direction, where the Pedersen commitment MUST use the same Keccak hash as Ethereum's native `keccak256` opcode.
+To avoid "cross-chain friction," the Go prover and Solidity contracts are strictly aligned on Keccak256. This is used for generating field elements from hashes (Hash-to-Field) within the Solidity verifier, ensuring that cryptographic commitments (if used in future) or intermediate hashes match Ethereum's native `keccak256` opcode.
 
 ### 5.2 Robust Path Resolution
 All binaries (setup, relayer) implement dynamic path detection. By locating `go.mod`, they resolve the project root, ensuring that `keys/` and `contracts/` are accessible regardless of the execution context.
 
 ### 5.3 Automated Root Synchronization (The "Synchronizer" Pattern)
 The relayer acts as a "Trust Synchronizer":
-- **Detection**: It monitors block headers on both chains.
-- **Sync**: Before submitting a bridge proof, it ensures the destination contract's `trustedRoot` is updated.
-- **Mechanism (POC)**: In this version, the relayer calls an administrative `updateTrustedRoot` function.
-- **Production Path**: This would be replaced by a ZK-Light Client (for Tendermint) or EVM-Light Client (for Ethereum headers) where the contract verifies the consensus of the peer chain cryptographically.
+- **Detection**: It monitors block headers and events on both chains.
+- **Sync**: Before submitting a bridge proof, it ensures the destination contract's `ValidatorsHash` and `trustedRoot` are up-to-date using `updateValidatorSet` and `verifyHeader`.
+- **Mechanism (Production)**: In this production version, the relayer submits ZK proofs that the contract verifies cryptographically. The "Admin" update model is replaced by fully trustless, in-circuit validator set and header verification.
 
 ---
 
@@ -193,13 +217,22 @@ The relayer acts as a "Trust Synchronizer":
 
 - **Replay Protection**: Both contracts maintain a `processedTxs` mapping to ensure each cross-chain transaction is handled exactly once.
 - **Double-Spending**: Assets are only released (minted/unlocked) if a valid cryptographic proof (ZK or MPT) is provided.
-- **Validator Set Trust**: The current POC uses an **"Automated Admin"** model. The relayer is trusted to update the `trustedRoot` on Ethereum and `trustedEthReceiptRoot` on Cosmos via administrative functions.
+- **Sequential Height Enforcement**: The `EthBridge` contract maintains a `lastProcessedHeight`. Every header sync must be for a height strictly greater than the current state, preventing "long-range" attacks.
+- **Finality Threshold**: To prevent reorg attacks, the relayer enforces a **2-epoch wait (~13 mins)** for Ethereum events and a **3-block wait** for Cosmos events before generating proofs.
+- **Validator Set Trust**: Trust is maintained cryptographically via the **TransitionCircuit**, ensuring every validator set change is signed by the previous set.
 - **Production Path**: A fully trustless bridge requires:
   - **EVM-Light Client**: To verify Ethereum PoS headers on Cosmos.
   - **ZK-Light Client**: To verify Tendermint header consensus on Ethereum.
 
-### 6.1 Rationale: Why no on-chain Light Client in this POC?
-Full on-chain header verification was deferred to prioritize the **cryptographic core** (ZK/MPT) for the following reasons:
-1. **Gas & Precompiles**: BLS12-381 verification (required for Ethereum Sync Committees) is extremely gas-intensive without specific EVM precompiles.
-2. **Complexity Decoupling**: Separation of **Header Trust** (Light Client) from **Payload Trust** (MPT/ZK) allows for a modular upgrade path.
-3. **Strategic Focus**: The primary challenge was proving transaction inclusion; header consensus is a well-understood but boilerplate-heavy "pre-requisite" that can be plugged in later.
+### 6.2 Governance & Scalability FAQ
+
+**Q: What happens if the Cosmos validator set size changes via a governance proposal?**
+
+1.  **Hard Limit**: The ZK circuit is compiled with a fixed `MaxValidators` capacity. This is a cryptographic constraint of the Groth16 proof system.
+2.  **Failure Mode**: If the actual validator set size on Cosmos exceeds the circuit's `MaxValidators`, the proving process will fail because the circuit cannot accommodate the additional public keys or voting power weights.
+3.  **Upgrade Process**:
+    - **Step 1**: Update the `MAX_VALIDATORS` environment variable to the new required capacity.
+    - **Step 2**: Re-run the setup command (`go run cmd/setup/main.go`) to generate new proving/verifying keys and an updated `Verifier_Validators.sol`.
+    - **Step 3**: Deploy the new verifier contract on Ethereum.
+    - **Step 4**: Update the `EthBridge` contract with the new verifier address. This ensures the bridge remains trustless while scaling to meet the new network requirements.
+4.  **Optimization Recommendation**: For production deployments, it is recommended to set `MaxValidators` to a generous upper bound (e.g., 25% higher than the current set) to allow for growth without immediate re-keying.

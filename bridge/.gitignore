@@ -2,8 +2,9 @@
 build/
 keys/
 .env
-proof_event.json
-Verifier.sol
+proof_*.json
+contracts/Verifier_*.sol
+contracts/Verifier.sol
 
 # Go
 vendor/
@@ -28,3 +29,10 @@ diagnostic_output.txt
 *.log
 .DS_Store
 last_eth_block.txt
+.vscode/
+.idea/
+*.test
+*.out
+*.prof
+node_modules/
+bin/

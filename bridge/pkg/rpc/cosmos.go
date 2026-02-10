@@ -135,6 +135,84 @@ func (r *TxResponse) GetEvmHash() string {
 	return ""
 }
 
+// ValidatorSetResponse captures response from /validators
+type ValidatorSetResponse struct {
+	Result struct {
+		BlockHeight    string      `json:"block_height"`
+		Validators     []Validator `json:"validators"`
+		Total          string      `json:"total"`
+		ValidatorsHash string      `json:"validators_hash"`
+	} `json:"result"`
+}
+
+type Validator struct {
+	Address string `json:"address"`
+	PubKey  struct {
+		Type  string `json:"type"`
+		Value string `json:"value"` // base64
+	} `json:"pub_key"`
+	VotingPower string `json:"voting_power"`
+}
+
+// CommitResponse captures response from /commit
+type CommitResponse struct {
+	Result struct {
+		SignedHeader struct {
+			Header struct {
+				Height         string `json:"height"`
+				Time           string `json:"time"`
+				ChainID        string `json:"chain_id"`
+				ValidatorsHash string `json:"validators_hash"`
+				AppHash        string `json:"app_hash"`
+				DataHash       string `json:"data_hash"`
+			} `json:"header"`
+			Commit struct {
+				Height     string      `json:"height"`
+				Signatures []CommitSig `json:"signatures"`
+			} `json:"commit"`
+		} `json:"signed_header"`
+	} `json:"result"`
+}
+
+type CommitSig struct {
+	BlockIDFlag      int    `json:"block_id_flag"`
+	ValidatorAddress string `json:"validator_address"`
+	Timestamp        string `json:"timestamp"`
+	Signature        string `json:"signature"` // base64
+}
+
+func (c *CosmosClient) GetValidators(height string) (*ValidatorSetResponse, error) {
+	url := fmt.Sprintf("%s/validators?height=%s", c.RpcUrl, height)
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := ioutil.ReadAll(resp.Body)
+	var valResp ValidatorSetResponse
+	if err := json.Unmarshal(body, &valResp); err != nil {
+		return nil, err
+	}
+	return &valResp, nil
+}
+
+func (c *CosmosClient) GetCommit(height string) (*CommitResponse, error) {
+	url := fmt.Sprintf("%s/commit?height=%s", c.RpcUrl, height)
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := ioutil.ReadAll(resp.Body)
+	var commitResp CommitResponse
+	if err := json.Unmarshal(body, &commitResp); err != nil {
+		return nil, err
+	}
+	return &commitResp, nil
+}
+
 func decodeStringIfSmall(s string) string {
 	if s == "" || len(s)%4 != 0 {
 		return s

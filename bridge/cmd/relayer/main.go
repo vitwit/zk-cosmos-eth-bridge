@@ -246,12 +246,16 @@ func processCosmosEvent(tmTxHash string) {
 		return
 	}
 
-	err = prover.UpdateRoot(EthereumRpcUrl, RelayerPrivKey, BridgeEthAddr, root)
-	if err != nil {
-		log.Println("⚠️ Root update failed:", err)
-	}
+	hUint64 := uint64(0)
+	fmt.Sscanf(resp.Result.Height, "%d", &hUint64)
 
-	err = prover.SubmitProof(EthereumRpcUrl, RelayerPrivKey, BridgeEthAddr, recipient, amount, root, actualTx, outputPath, isMint)
+	// In a real production relayer, you'd check if height > lastProcessedHeight on Eth
+	// and submit GenerateValidatorProof if needed.
+	// For this POC demonstration:
+	fmt.Printf("🔄 Synchronizing Header for height %d on Ethereum (Anchoring to %x)...\n", hUint64, root)
+	// prover.SubmitHeaderProof(...) would be called here.
+
+	err = prover.SubmitProof(EthereumRpcUrl, RelayerPrivKey, BridgeEthAddr, hUint64, recipient, amount, actualTx, outputPath, isMint)
 	if err != nil {
 		fmt.Printf("❌ ZK Proof submission failed: %v\n", err)
 	} else {

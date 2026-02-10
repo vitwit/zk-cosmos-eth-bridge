@@ -12,7 +12,7 @@ This guide provides a unified workflow for deploying the Cosmos-Eth Bridge contr
   - [Foundry](https://book.getfoundry.sh/getting-started/installation) (for Forge/Cast)
   - Go 1.21+
   - Node.js & npm
-- **Local Environment** (Required for POC testing):
+- **Local Environment** (Required for local testing):
   - **Anvil (Ethereum)**: Part of Foundry.
   - **Cosmos Local Node**: The project's native build (see `./local_evm_node.sh`).
 
@@ -40,28 +40,32 @@ Generate the verifier contract and cryptographic keys. **This is required before
 ```bash
 go run cmd/setup/main.go
 ```
-- **Output**: `keys/proving.key`, `keys/verifying.key`, and `contracts/Verifier.sol`.
+- **Output**: `keys/*.proving.key`, `keys/*.verifying.key`, and `contracts/Verifier_*.sol` (Transactions, Validators, Transitions).
 
 ---
 
 ### Step A: Deploy to Ethereum
 The `EthBridge.sol` handles Cosmos → Ethereum (Minting) and Ethereum → Cosmos (Burning).
 
-1. **Deploy Verifier**:
-   Generate the `Verifier.sol` via `go run cmd/setup/main.go` first.
+1. **Deploy Verifiers**:
+   Generate the verifier contracts (`Verifier_Transactions.sol`, `Verifier_Validators.sol`, `Verifier_Transitions.sol`) via `go run cmd/setup/main.go` first.
    ```bash
-   forge create --rpc-url $ETH_RPC --private-key $PRIV_KEY contracts/Verifier.sol:Verifier
+   forge create --rpc-url $ETH_RPC --private-key $PRIV_KEY contracts/Verifier_Transactions.sol:Verifier
+   forge create --rpc-url $ETH_RPC --private-key $PRIV_KEY contracts/Verifier_Validators.sol:Verifier
+   forge create --rpc-url $ETH_RPC --private-key $PRIV_KEY contracts/Verifier_Transitions.sol:Verifier
    ```
-   **Record address**: `$VERIFIER_ADDR`
+   **Record addresses**: `$TX_VERIFIER`, `$VAL_VERIFIER`, `$TRANS_VERIFIER`
 
 2. **Deploy EthBridge**:
-   Requires the Verifier address and an initial Cosmos Root (`data_hash`).
+   Requires the three Verifier addresses and the initial Cosmos validator set.
    ```bash
-   # Get current Cosmos root
-   export INITIAL_ROOT=$(curl -s $COSMOS_RPC/block | jq -r '.result.block.header.data_hash' | xargs -I {} echo 0x{})
+   # Get current Cosmos validator set hash and height
+   export INITIAL_VAL_SET_HASH=$(curl -s $COSMOS_RPC/block | jq -r '.result.block.header.validators_hash' | xargs -I {} echo 0x{})
+   export INITIAL_HEIGHT=$(curl -s $COSMOS_RPC/status | jq -r '.result.sync_info.latest_block_height')
    
    # Deploy
-   forge create --rpc-url $ETH_RPC --private-key $PRIV_KEY contracts/EthBridge.sol:EthBridge --constructor-args $VERIFIER_ADDR $INITIAL_ROOT
+   forge create --rpc-url $ETH_RPC --private-key $PRIV_KEY contracts/EthBridge.sol:EthBridge \
+     --constructor-args $TX_VERIFIER $VAL_VERIFIER $TRANS_VERIFIER $INITIAL_VAL_SET_HASH $INITIAL_HEIGHT
    ```
    **Record address**: `$ETH_BRIDGE_ADDR`
 
@@ -104,7 +108,8 @@ Smart contracts are immutable. To change logic:
 ### Root Management (Manual)
 The `EthBridge` requires a `trustedRoot` from Cosmos.
 - **Get Root**: `curl -s localhost:26657/block | jq -r '.result.block.header.data_hash'`.
-- **Update**: Call `updateTrustedRoot(0x...)` on the `EthBridge` contract.
+- **Sync Header**: Call `verifyHeader(...)` on the `EthBridge` contract with a valid ZK proof.
+- **Update Set**: Call `updateValidatorSet(...)` if the validator set has changed.
 
 ---
 
