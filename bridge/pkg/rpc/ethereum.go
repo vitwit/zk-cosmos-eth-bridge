@@ -2,6 +2,8 @@ package rpc
 
 import (
 	"bytes"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -117,6 +119,38 @@ func (c *EthClient) GetReceiptRoot(blockNumber string) (string, error) {
 	return block.ReceiptsRoot, nil
 }
 
+// GetTrustedRoot calls the trustedRoots mapping on the EthBridge contract.
+func (c *EthClient) GetTrustedRoot(bridgeAddr string, height uint64) ([32]byte, error) {
+	var root [32]byte
+
+	// Prepare data for trustedRoots(uint256)
+	// Function selector for trustedRoots(uint256) is 0x6e267926
+	heightBytes := make([]byte, 32)
+	binary.BigEndian.PutUint64(heightBytes[24:], height)
+	data := "0x6e267926" + hex.EncodeToString(heightBytes)
+
+	result, err := c.Call("eth_call", map[string]interface{}{
+		"to":   bridgeAddr,
+		"data": data,
+	}, "latest")
+	if err != nil {
+		return root, err
+	}
+
+	var hexResult string
+	if err := json.Unmarshal(result, &hexResult); err != nil {
+		return root, err
+	}
+
+	bz, err := hex.DecodeString(strings.TrimPrefix(hexResult, "0x"))
+	if err != nil || len(bz) != 32 {
+		return root, fmt.Errorf("invalid root returned: %s", hexResult)
+	}
+
+	copy(root[:], bz)
+	return root, nil
+}
+
 type ReceiptProof struct {
 	ReceiptRoot string   `json:"receiptRoot"`
 	Proof       [][]byte `json:"proof"`
@@ -151,9 +185,9 @@ func (c *EthClient) GetReceiptProof(txHash string) (*ReceiptProof, error) {
 		return nil, err
 	}
 
-	// 3. Fetch all receipts for the block (Production-like step)
+	// 3. Fetch all receipts for the block.
 	// Some nodes support eth_getBlockReceipts, which is much faster.
-	// For this POC, we simulate the trie build from all block receipts.
+	// Here we simulate the trie build from all block receipts.
 	db := triedb.NewDatabase(rawdb.NewMemoryDatabase(), nil)
 	t := trie.NewEmpty(db)
 	var targetKey []byte

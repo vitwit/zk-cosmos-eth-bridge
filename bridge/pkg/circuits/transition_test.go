@@ -17,8 +17,10 @@ func TestTransitionCircuit(t *testing.T) {
 	var circuit TransitionCircuit
 
 	var witness TransitionCircuit
-	witness.OldValidatorsHash = 0
-	witness.NewValidatorsHash = 0
+	for i := 0; i < 4; i++ {
+		witness.PackedOldValidatorsHash[i] = 0
+		witness.PackedNewValidatorsHash[i] = 0
+	}
 	witness.TotalPower = 100
 
 	for i := 0; i < MaxValidators; i++ {

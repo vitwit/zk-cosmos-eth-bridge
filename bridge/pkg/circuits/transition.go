@@ -15,8 +15,8 @@ import (
 // TransitionCircuit verifies that the old validator set has signed a new validator set hash.
 type TransitionCircuit struct {
 	// Public Inputs
-	OldValidatorsHash frontend.Variable `gnark:",public"`
-	NewValidatorsHash frontend.Variable `gnark:",public"`
+	PackedOldValidatorsHash [4]frontend.Variable `gnark:",public"`
+	PackedNewValidatorsHash [4]frontend.Variable `gnark:",public"`
 
 	// Private Inputs (The Old Validator Set)
 	VotingPowers []frontend.Variable
@@ -37,6 +37,9 @@ func (c *TransitionCircuit) Define(api frontend.API) error {
 	u8Api, _ := uints.NewBytes(api)
 	baseApi, _ := emulated.NewField[emulated.Secp256k1Fp](api)
 
+	// Unpack OldValidatorsHash
+	oldVhBytes := c.unpack(api, c.PackedOldValidatorsHash)
+
 	for i := 0; i < MaxValidators; i++ {
 		xBits := baseApi.ToBits(&c.PublicKeys[i].X)
 		yBits := baseApi.ToBits(&c.PublicKeys[i].Y)
@@ -49,20 +52,25 @@ func (c *TransitionCircuit) Define(api frontend.API) error {
 	}
 
 	actualOldHash := sha.Sum()
-	vhBits := api.ToBinary(c.OldValidatorsHash, 256)
 
-	// Match bit-by-bit (Big Endian)
+	// Match byte-by-byte
 	for i := 0; i < 32; i++ {
-		byteBits := api.ToBinary(actualOldHash[i].Val, 8)
-		for j := 0; j < 8; j++ {
-			api.AssertIsEqual(byteBits[7-j], vhBits[255-(i*8+j)])
-		}
+		api.AssertIsEqual(actualOldHash[i].Val, oldVhBytes[i].Val)
 	}
 
 	// 2. Verify that OldSet signed NewValidatorsHash
 	params := sw_emulated.GetSecp256k1Params()
 	scalarApi, _ := emulated.NewField[emulated.Secp256k1Fr](api)
-	msg := scalarApi.FromBits(api.ToBinary(c.NewValidatorsHash, 256)...)
+
+	newVhBytes := c.unpack(api, c.PackedNewValidatorsHash)
+	var newVhBits []frontend.Variable
+	for i := 0; i < 32; i++ {
+		byteBits := api.ToBinary(newVhBytes[i].Val, 8)
+		for j := 7; j >= 0; j-- {
+			newVhBits = append(newVhBits, byteBits[j])
+		}
+	}
+	msg := scalarApi.FromBits(newVhBits...)
 
 	var signedPower frontend.Variable = 0
 	var totalPowerCalculated frontend.Variable = 0
@@ -85,6 +93,20 @@ func (c *TransitionCircuit) Define(api frontend.API) error {
 	api.AssertIsEqual(comparator.IsLess(lhs, rhs), 0)
 
 	return nil
+}
+
+// unpack converts 4 x uint64 variables into 32 byte-sized variables.
+func (c *TransitionCircuit) unpack(api frontend.API, packed [4]frontend.Variable) []uints.U8 {
+	var res []uints.U8
+	for i := 0; i < 4; i++ {
+		bits := api.ToBinary(packed[i], 64)
+		for j := 7; j >= 0; j-- {
+			start := j * 8
+			byteValue := api.FromBinary(bits[start : start+8]...)
+			res = append(res, uints.U8{Val: byteValue})
+		}
+	}
+	return res
 }
 
 // AllocateSlices initializes the circuit slices with MaxValidators capacity.

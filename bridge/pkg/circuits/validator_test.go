@@ -19,9 +19,13 @@ func TestValidatorCircuit(t *testing.T) {
 	// Create witness
 	var witness ValidatorCircuit
 	witness.TotalPower = 70
-	witness.BlockHash = 0
-	witness.ValidatorsHash = 0
 	witness.Height = 100
+
+	for i := 0; i < 4; i++ {
+		witness.PackedValidatorsHash[i] = 0
+		witness.PackedBlockHash[i] = 0
+		witness.PackedDataHash[i] = 0
+	}
 
 	for i := 0; i < MaxValidators; i++ {
 		witness.VotingPowers[i] = 0

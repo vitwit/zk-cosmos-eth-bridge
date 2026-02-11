@@ -3,6 +3,7 @@ package prover
 import (
 	"context"
 	"crypto/ecdsa"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -242,18 +243,37 @@ func GenerateValidatorProof(cosmosRpcUrl string, height string, outputPath strin
 	totalPower.SetString(valResp.Result.Total, 10)
 	witness.TotalPower = &totalPower
 
-	// ValidatorsHash from public input
+	// ValidatorsHash from public input (32 bytes -> 4x uint64)
 	vHash, _ := rpc.DecodeHash(valResp.Result.ValidatorsHash)
-	witness.ValidatorsHash = binary.BigEndian.Uint64(vHash[:8])
+	for i := 0; i < 4; i++ {
+		witness.PackedValidatorsHash[i] = binary.BigEndian.Uint64(vHash[i*8 : (i+1)*8])
+	}
 
-	// BlockHash (The message being signed)
-	bHash, _ := rpc.DecodeHash(commitResp.Result.SignedHeader.Header.AppHash)
-	witness.BlockHash = binary.BigEndian.Uint64(bHash[:8])
+	// DataHash (The transaction root for inclusion proofs)
+	dHash, _ := rpc.DecodeHash(commitResp.Result.SignedHeader.Header.DataHash)
+	for i := 0; i < 4; i++ {
+		witness.PackedDataHash[i] = binary.BigEndian.Uint64(dHash[i*8 : (i+1)*8])
+	}
 
 	// Height
 	hInt := new(big.Int)
 	hInt.SetString(height, 10)
 	witness.Height = hInt
+
+	// BlockHash (The message being signed)
+	// The circuit expects a simulated block hash: SHA256(ValidatorsHash || DataHash || Height)
+	h := sha256.New()
+	h.Write(vHash)
+	h.Write(dHash)
+
+	heightBytes := make([]byte, 8)
+	binary.LittleEndian.PutUint64(heightBytes, uint64(hInt.Int64()))
+	h.Write(heightBytes)
+
+	simulatedBH := h.Sum(nil)
+	for i := 0; i < 4; i++ {
+		witness.PackedBlockHash[i] = binary.BigEndian.Uint64(simulatedBH[i*8 : (i+1)*8])
+	}
 
 	for i := 0; i < circuits.MaxValidators && i < len(valResp.Result.Validators); i++ {
 		v := valResp.Result.Validators[i]
@@ -295,8 +315,58 @@ func GenerateValidatorProof(cosmosRpcUrl string, height string, outputPath strin
 	}
 	fmt.Printf("📊 Validator Circuit compiled: %d constraints\n", ccs.GetNbConstraints())
 
-	fmt.Println("✅ Validator data successfully fetched and witness prepared.")
-	return nil
+	fmt.Println("⚙️  Step 2/4: Loading Validator Proving Key...")
+	pk := groth16.NewProvingKey(ecc.BN254)
+	pkFile, err := os.Open("keys/Validators.proving.key")
+	if err != nil {
+		return fmt.Errorf("validators proving key not found! Run setup first")
+	}
+	pk.ReadFrom(pkFile)
+	pkFile.Close()
+
+	fmt.Println("⚙️  Step 3/4: Generating Validator Witness...")
+	fullWitness, err := frontend.NewWitness(&witness, ecc.BN254.ScalarField())
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("🚀 Step 4/4: Calculating Validator ZK-SNARK Proof...")
+	proof, err := groth16.Prove(ccs, pk, fullWitness)
+	if err != nil {
+		return err
+	}
+
+	// 3. Export JSON
+	bn254Proof := proof.(*gnark_bn254.Proof)
+	publicInputs := make([]string, 14)
+	for i := 0; i < 4; i++ {
+		publicInputs[i] = fmt.Sprintf("%d", witness.PackedValidatorsHash[i])
+		publicInputs[4+i] = fmt.Sprintf("%d", witness.PackedBlockHash[i])
+		publicInputs[8+i] = fmt.Sprintf("%d", witness.PackedDataHash[i])
+	}
+	publicInputs[12] = hInt.String()
+	publicInputs[13] = totalPower.String()
+
+	data := struct {
+		A             [2]string    `json:"a"`
+		B             [2][2]string `json:"b"`
+		C             [2]string    `json:"c"`
+		Commitments   [2]string    `json:"commitments"`
+		CommitmentPok [2]string    `json:"commitmentPok"`
+		Public        []string     `json:"public"`
+	}{
+		A: [2]string{bn254Proof.Ar.X.String(), bn254Proof.Ar.Y.String()},
+		B: [2][2]string{
+			{bn254Proof.Bs.X.A1.String(), bn254Proof.Bs.X.A0.String()},
+			{bn254Proof.Bs.Y.A1.String(), bn254Proof.Bs.Y.A0.String()},
+		},
+		C:      [2]string{bn254Proof.Krs.X.String(), bn254Proof.Krs.Y.String()},
+		Public: publicInputs,
+	}
+
+	out, _ := json.MarshalIndent(data, "", "  ")
+	fmt.Printf("💾 Saving validator proof to %s\n", outputPath)
+	return os.WriteFile(outputPath, out, 0o644)
 }
 
 // GenerateTransitionProof fetches two validator sets and generates a SNARK proof for a set transition.
@@ -322,13 +392,17 @@ func GenerateTransitionProof(cosmosRpcUrl string, oldHeight string, newHeight st
 	}
 
 	var witness circuits.TransitionCircuit
-	// Populate NewValidatorsHash (The message signed by the old set)
+	// Populate NewValidatorsHash (32 bytes -> 4x uint64)
 	nvHash, _ := rpc.DecodeHash(newValResp.Result.ValidatorsHash)
-	witness.NewValidatorsHash = binary.BigEndian.Uint64(nvHash[:8])
+	for i := 0; i < 4; i++ {
+		witness.PackedNewValidatorsHash[i] = binary.BigEndian.Uint64(nvHash[i*8 : (i+1)*8])
+	}
 
 	// Populate OldValidatorsHash
 	ovHash, _ := rpc.DecodeHash(oldValResp.Result.ValidatorsHash)
-	witness.OldValidatorsHash = binary.BigEndian.Uint64(ovHash[:8])
+	for i := 0; i < 4; i++ {
+		witness.PackedOldValidatorsHash[i] = binary.BigEndian.Uint64(ovHash[i*8 : (i+1)*8])
+	}
 
 	// ... Map Old Set and Signatures ...
 	sigs := make(map[string]rpc.CommitSig)
@@ -370,8 +444,55 @@ func GenerateTransitionProof(cosmosRpcUrl string, oldHeight string, newHeight st
 	}
 	fmt.Printf("📊 Transition Circuit compiled: %d constraints\n", ccs.GetNbConstraints())
 
-	fmt.Println("✅ Transition witness prepared.")
-	return nil
+	fmt.Println("⚙️  Step 2/4: Loading Transition Proving Key...")
+	pk := groth16.NewProvingKey(ecc.BN254)
+	pkFile, err := os.Open("keys/Transitions.proving.key")
+	if err != nil {
+		return fmt.Errorf("transitions proving key not found! Run setup first")
+	}
+	pk.ReadFrom(pkFile)
+	pkFile.Close()
+
+	fmt.Println("⚙️  Step 3/4: Generating Transition Witness...")
+	fullWitness, err := frontend.NewWitness(&witness, ecc.BN254.ScalarField())
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("🚀 Step 4/4: Calculating Transition ZK-SNARK Proof...")
+	proof, err := groth16.Prove(ccs, pk, fullWitness)
+	if err != nil {
+		return err
+	}
+
+	// 3. Export JSON
+	bn254Proof := proof.(*gnark_bn254.Proof)
+	publicInputs := make([]string, 8)
+	for i := 0; i < 4; i++ {
+		publicInputs[i] = fmt.Sprintf("%d", witness.PackedOldValidatorsHash[i])
+		publicInputs[4+i] = fmt.Sprintf("%d", witness.PackedNewValidatorsHash[i])
+	}
+
+	data := struct {
+		A             [2]string    `json:"a"`
+		B             [2][2]string `json:"b"`
+		C             [2]string    `json:"c"`
+		Commitments   [2]string    `json:"commitments"`
+		CommitmentPok [2]string    `json:"commitmentPok"`
+		Public        []string     `json:"public"`
+	}{
+		A: [2]string{bn254Proof.Ar.X.String(), bn254Proof.Ar.Y.String()},
+		B: [2][2]string{
+			{bn254Proof.Bs.X.A1.String(), bn254Proof.Bs.X.A0.String()},
+			{bn254Proof.Bs.Y.A1.String(), bn254Proof.Bs.Y.A0.String()},
+		},
+		C:      [2]string{bn254Proof.Krs.X.String(), bn254Proof.Krs.Y.String()},
+		Public: publicInputs,
+	}
+
+	out, _ := json.MarshalIndent(data, "", "  ")
+	fmt.Printf("💾 Saving transition proof to %s\n", outputPath)
+	return os.WriteFile(outputPath, out, 0o644)
 }
 
 // UpdateValidatorSetOnEth submits a transition proof to the Ethereum bridge.
@@ -382,7 +503,7 @@ func UpdateValidatorSetOnEth(ethRpcUrl string, privKeyHex string, bridgeAddr str
 }
 
 // SubmitHeaderProof submits a block finality proof to the EthBridge.
-func SubmitHeaderProof(ethRpcUrl string, privKeyHex string, bridgeAddr string, height uint64, blockHash [32]byte, totalPower *big.Int, proofPath string) error {
+func SubmitHeaderProof(ethRpcUrl string, privKeyHex string, bridgeAddr string, height uint64, blockHash [32]byte, dataHash [32]byte, totalPower *big.Int, proofPath string) error {
 	client, err := ethclient.Dial(ethRpcUrl)
 	if err != nil {
 		return err
@@ -429,11 +550,11 @@ func SubmitHeaderProof(ethRpcUrl string, privKeyHex string, bridgeAddr string, h
 		}
 	}
 
-	abiJSON := `[{"inputs":[{"internalType":"uint256[2]","name":"a","type":"uint256[2]"},{"internalType":"uint256[2][2]","name":"b","type":"uint256[2][2]"},{"internalType":"uint256[2]","name":"c","type":"uint256[2]"},{"internalType":"uint256[2]","name":"commitments","type":"uint256[2]"},{"internalType":"uint256[2]","name":"commitmentPok","type":"uint256[2]"},{"internalType":"bytes32","name":"blockHash","type":"bytes32"},{"internalType":"uint256","name":"height","type":"uint256"},{"internalType":"uint256","name":"totalPower","type":"uint256"}],"name":"verifyHeader","outputs":[],"stateMutability":"nonpayable","type":"function"}]`
+	abiJSON := `[{"inputs":[{"internalType":"uint256[2]","name":"a","type":"uint256[2]"},{"internalType":"uint256[2][2]","name":"b","type":"uint256[2][2]"},{"internalType":"uint256[2]","name":"c","type":"uint256[2]"},{"internalType":"uint256[2]","name":"commitments","type":"uint256[2]"},{"internalType":"uint256[2]","name":"commitmentPok","type":"uint256[2]"},{"internalType":"bytes32","name":"blockHash","type":"bytes32"},{"internalType":"bytes32","name":"dataHash","type":"bytes32"},{"internalType":"uint256","name":"height","type":"uint256"},{"internalType":"uint256","name":"totalPower","type":"uint256"}],"name":"verifyHeader","outputs":[],"stateMutability":"nonpayable","type":"function"}]`
 	parsedABI, _ := abi.JSON(strings.NewReader(abiJSON))
 	contract := bind.NewBoundContract(common.HexToAddress(bridgeAddr), parsedABI, client, client, client)
 
-	tx, err := contract.Transact(auth, "verifyHeader", a, b, c, commits, pok, blockHash, big.NewInt(int64(height)), totalPower)
+	tx, err := contract.Transact(auth, "verifyHeader", a, b, c, commits, pok, blockHash, dataHash, big.NewInt(int64(height)), totalPower)
 	if err != nil {
 		return err
 	}

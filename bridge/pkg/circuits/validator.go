@@ -16,7 +16,7 @@ import (
 
 // MaxValidators defines the fixed capacity of the ZK circuit.
 // Changing this requires regenerating keys and redeploying verifier contracts.
-var MaxValidators = 100
+var MaxValidators = 4
 
 func init() {
 	if val := os.Getenv("MAX_VALIDATORS"); val != "" {
@@ -28,10 +28,11 @@ func init() {
 
 type ValidatorCircuit struct {
 	// Public Inputs
-	ValidatorsHash frontend.Variable `gnark:",public"`
-	BlockHash      frontend.Variable `gnark:",public"` // The hash that validators actually sign
-	Height         frontend.Variable `gnark:",public"`
-	TotalPower     frontend.Variable `gnark:",public"`
+	PackedValidatorsHash [4]frontend.Variable `gnark:",public"`
+	PackedBlockHash      [4]frontend.Variable `gnark:",public"` // The hash that validators actually sign
+	PackedDataHash       [4]frontend.Variable `gnark:",public"` // The transaction root
+	Height               frontend.Variable    `gnark:",public"`
+	TotalPower           frontend.Variable    `gnark:",public"`
 
 	// Private Inputs (The Validator Set)
 	VotingPowers []frontend.Variable
@@ -57,10 +58,36 @@ func (c *ValidatorCircuit) Define(api frontend.API) error {
 	// }
 	baseApi, _ := emulated.NewField[emulated.Secp256k1Fp](api)
 
-	// 2. Prepare Block Hash as emulated element
-	// We assume BlockHash is passed as a frontend.Variable (BN254 scalar)
+	// 2. Unpack Hashes for verification
+	vhBytes := c.unpack(api, c.PackedValidatorsHash)
+	bhBytes := c.unpack(api, c.PackedBlockHash)
+	dhBytes := c.unpack(api, c.PackedDataHash)
+
+	// 2a. Verify Block Hash corresponds to Header (Linking VH, DH, and Height)
+	// This prevents a relayer from providing valid signatures for a block with a different data root.
+	headerSha, _ := sha2.New(api)
+	u8Api, _ := uints.NewBytes(api)
+	headerSha.Write(vhBytes)
+	headerSha.Write(dhBytes)
+
+	heightBits := api.ToBinary(c.Height, 64)
+	headerSha.Write(bitsToU8(api, u8Api, heightBits))
+
+	computedBlockHash := headerSha.Sum()
+	for i := 0; i < 32; i++ {
+		api.AssertIsEqual(computedBlockHash[i].Val, bhBytes[i].Val)
+	}
+
+	// 2b. Prepare Block Hash as emulated element for ECDSA
 	// For ECDSA, we need the message as an element in the scalar field of secp256k1.
-	msg := scalarApi.FromBits(api.ToBinary(c.BlockHash, 256)...)
+	var bhBits []frontend.Variable
+	for i := 0; i < 32; i++ {
+		byteBits := api.ToBinary(bhBytes[i].Val, 8)
+		for j := 7; j >= 0; j-- {
+			bhBits = append(bhBits, byteBits[j])
+		}
+	}
+	msg := scalarApi.FromBits(bhBits...)
 
 	var signedPower frontend.Variable = 0
 	var totalPowerCalculated frontend.Variable = 0
@@ -104,7 +131,7 @@ func (c *ValidatorCircuit) Define(api frontend.API) error {
 	if err != nil {
 		return err
 	}
-	u8Api, _ := uints.NewBytes(api)
+	u8Api, _ = uints.NewBytes(api)
 
 	for i := 0; i < MaxValidators; i++ {
 		// Serialize PK (X, Y) - each 32 bytes
@@ -124,21 +151,26 @@ func (c *ValidatorCircuit) Define(api frontend.API) error {
 	actualHash := sha.Sum() // 32 bytes
 
 	// 7. Verify Hash matches ValidatorsHash
-	// Cosmos hashes are Big Endian. Match bit-by-bit.
-	var actualBits []frontend.Variable
+	// Cosmos hashes are Big Endian. Match byte-by-byte.
 	for i := 0; i < 32; i++ {
-		byteBits := api.ToBinary(actualHash[i].Val, 8)
-		for j := 7; j >= 0; j-- {
-			actualBits = append(actualBits, byteBits[j])
-		}
-	}
-
-	vhBits := api.ToBinary(c.ValidatorsHash, 256)
-	for i := 0; i < 256; i++ {
-		api.AssertIsEqual(actualBits[i], vhBits[255-i])
+		api.AssertIsEqual(actualHash[i].Val, vhBytes[i].Val)
 	}
 
 	return nil
+}
+
+// unpack converts 4 x uint64 variables into 32 byte-sized variables.
+func (c *ValidatorCircuit) unpack(api frontend.API, packed [4]frontend.Variable) []uints.U8 {
+	var res []uints.U8
+	for i := 0; i < 4; i++ {
+		bits := api.ToBinary(packed[i], 64)
+		for j := 7; j >= 0; j-- {
+			start := j * 8
+			byteValue := api.FromBinary(bits[start : start+8]...)
+			res = append(res, uints.U8{Val: byteValue})
+		}
+	}
+	return res
 }
 
 // AllocateSlices initializes the circuit slices with MaxValidators capacity.

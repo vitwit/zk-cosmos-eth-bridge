@@ -106,9 +106,9 @@ Smart contracts are immutable. To change logic:
 3. **IMPORTANT**: Update your `.env` file with the new contract address and restart the relayer.
 
 ### Root Management (Manual)
-The `EthBridge` requires a `trustedRoot` from Cosmos.
+The `EthBridge` requires a `trustedRoot` from Cosmos to verify transaction inclusion.
 - **Get Root**: `curl -s localhost:26657/block | jq -r '.result.block.header.data_hash'`.
-- **Sync Header**: Call `verifyHeader(...)` on the `EthBridge` contract with a valid ZK proof.
+- **Sync Header**: Call `verifyHeader(...)` on the `EthBridge` contract with a valid ZK proof. This anchors the `data_hash` as the `trustedRoot`.
 - **Update Set**: Call `updateValidatorSet(...)` if the validator set has changed.
 
 ---

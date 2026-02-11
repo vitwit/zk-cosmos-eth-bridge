@@ -3,7 +3,7 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
-interface IVerifier {
+interface IVerifier8 {
     function verifyProof(
         uint256[8] calldata proof,
         uint256[2] calldata commitments,
@@ -12,10 +12,19 @@ interface IVerifier {
     ) external view;
 }
 
+interface IVerifier14 {
+    function verifyProof(
+        uint256[8] calldata proof,
+        uint256[2] calldata commitments,
+        uint256[2] calldata commitmentPok,
+        uint256[14] calldata input
+    ) external view;
+}
+
 contract EthBridge is ERC20 {
-    IVerifier public immutable txnVerifier;
-    IVerifier public immutable validatorVerifier;
-    IVerifier public immutable transitionVerifier;
+    IVerifier8 public immutable txnVerifier;
+    IVerifier14 public immutable validatorVerifier;
+    IVerifier8 public immutable transitionVerifier;
 
     bytes32 public currentValidatorsHash;
     uint256 public lastProcessedHeight;
@@ -40,9 +49,9 @@ contract EthBridge is ERC20 {
         bytes32 _initialValidatorsHash,
         uint256 _initialHeight
     ) ERC20("Wrapped TEST", "WTEST") {
-        txnVerifier = IVerifier(_txnVerifier);
-        validatorVerifier = IVerifier(_validatorVerifier);
-        transitionVerifier = IVerifier(_transitionVerifier);
+        txnVerifier = IVerifier8(_txnVerifier);
+        validatorVerifier = IVerifier14(_validatorVerifier);
+        transitionVerifier = IVerifier8(_transitionVerifier);
         currentValidatorsHash = _initialValidatorsHash;
         lastProcessedHeight = _initialHeight;
     }
@@ -58,10 +67,12 @@ contract EthBridge is ERC20 {
         uint256[2] memory commitmentPok,
         bytes32 newValidatorsHash
     ) external {
-        // TransitionCircuit Inputs: [OldHash (4x64), NewHash (4x64)]
-        uint256[8] memory inputs = packTwoHashes(currentValidatorsHash, newValidatorsHash);
-        
+        // TransitionCircuit Public Inputs (8 field elements):
+        // [0..3]:   OldValidatorsHash (4x64)
+        // [4..7]:   NewValidatorsHash (4x64)
         uint256[8] memory proof = packProof(a, b, c);
+        uint256[8] memory inputs = packTwoHashes(currentValidatorsHash, newValidatorsHash);
+
         transitionVerifier.verifyProof(proof, commitments, commitmentPok, inputs);
 
         currentValidatorsHash = newValidatorsHash;
@@ -78,30 +89,34 @@ contract EthBridge is ERC20 {
         uint256[2] memory commitments,
         uint256[2] memory commitmentPok,
         bytes32 blockHash,
+        bytes32 dataHash,
         uint256 height,
         uint256 totalPower
     ) external {
         require(height > lastProcessedHeight, "Height must be strictly increasing");
 
-        // ValidatorCircuit Public Inputs (11 field elements):
-        // [0..3]: ValidatorsHash (256-bit)
-        // [4..7]: BlockHash (256-bit)
-        // [8]:    Height (uint256)
-        // [9]:    TotalPower (uint256)
-        // [10]:   Padding/Extra (0)
-        uint256[] memory inputs = new uint256[](11);
-        uint256[8] memory hashes = packTwoHashes(currentValidatorsHash, blockHash);
-        for(uint i=0; i<8; i++) inputs[i] = hashes[i];
-        inputs[8] = height;
-        inputs[9] = totalPower;
-        inputs[10] = 0;
+        // ValidatorCircuit Public Inputs (14 field elements):
+        // [0..3]:   ValidatorsHash (4x64)
+        // [4..7]:   BlockHash (4x64)
+        // [8..11]:  DataHash (4x64) - The transaction root
+        // [12]:     Height
+        // [13]:     TotalPower
+
+        uint256[8] memory proof = packProof(a, b, c);
+        uint256[] memory inputs = new uint256[](14);
+        uint256[8] memory hashes1 = packTwoHashes(currentValidatorsHash, blockHash);
+        uint256[8] memory hashes2 = packTwoHashes(dataHash, bytes32(0)); // Only need first 4 for DH
+
+        for(uint i=0; i<8; i++) inputs[i] = hashes1[i];
+        for(uint i=0; i<4; i++) inputs[8+i] = hashes2[i];
+        inputs[12] = height;
+        inputs[13] = totalPower;
 
         // Perform verification using the production Verifier
-        // Proof components (a, b, c) from Groth16 are passed along with public inputs
-        // validatorVerifier.verifyProof(a, b, c, inputs);
+        validatorVerifier.verifyProof(proof, commitments, commitmentPok, inputs);
 
         lastProcessedHeight = height;
-        trustedRoots[height] = blockHash; // In this POC, the blockHash acts as the root.
+        trustedRoots[height] = dataHash; // DH is the root for Merkle inclusion proofs.
         emit HeaderVerified(height, blockHash);
     }
 

@@ -60,7 +60,8 @@ This direction uses **Groth16 ZK-SNARKs** to verify Tendermint Merkle proofs on 
 
 - **Proving System**: Groth16 (BN254 curve).
 - **Emulated Arithmetic**: Uses non-native emulated arithmetic to verify Secp256k1 signatures on the BN254 curve.
-- **Input Packing**: 32-byte hashes are split into 4x `uint64` to maintain compatibility between the SNARK field and EVM words.
+- **Input Packing**: 32-byte hashes are split into 4x `uint64` (passed as `uint256` field elements) to maintain compatibility between the SNARK field and EVM words.
+- **Cryptographic Linking**: The `ValidatorCircuit` enforced a strict link between the signed `BlockHash` and the anchored `DataHash` (transaction root) and `ValidatorsHash` using SHA-256 inside the circuit.
 
 ### 3.2 Deep Dive: The ZK Process
 
@@ -90,12 +91,15 @@ EVM works with 256-bit words, but SNARKs often prefer smaller chunks to avoid fi
 - **Gas Savings**: This packing keeps the number of public inputs low, reducing the "pairing" operation costs in the Solidity verifier.
 
 #### E. Public Input Slots (Transactional)
-The `TransactionCircuit` verifier receives 8 `uint256` inputs in order:
-- `[0..3]`: **Merkle Root** (4x uint64)
-- `[4..7]`: **Transaction Hash** (4x uint64)
-The `EthBridge.sol` packs these dynamically from the 32-byte `bytes32` values before the call.
+Public inputs are packed into 64-bit chunks to ensure they fit within the BN254 field modulus without overflow.
 
-*Note: The Validator and Transition verifiers use different slot counts (10 and 8 respectively) to accommodate their specific cryptographic inputs.*
+| Circuit | Public Inputs | Description |
+|---------|---------------|-------------|
+| **Validator** | 14 | `ValidatorsHash` (4), `BlockHash` (4), `DataHash` (4), `Height` (1), `TotalPower` (1) |
+| **Transition** | 8 | `OldValidatorsHash` (4), `NewValidatorsHash` (4) |
+| **Transaction** | 8 | `MerkleRoot` (4), `TxHash` (4) |
+
+The `EthBridge.sol` uses `packTwoHashes` and manual assignment to prepare these inputs for the Solidity verifiers.
 
 ---
 
@@ -129,7 +133,7 @@ This direction uses **Merkle Patricia Trie (MPT)** verification, leveraging the 
 Instead of a ZK proof, the relayer provides a raw MPT inclusion proof extracted from the Ethereum transaction receipt.
 
 - **Storage**: The `CosmosBridge.sol` maintains a `trustedEthReceiptRoot` (the `receiptsRoot` of an Ethereum block).
-- **Verified Inclusion**: Unlike the previous POC version, **payloads are now cryptographically verified on-chain**.
+- **Verified Inclusion**: **Payloads are now cryptographically verified on-chain**.
 - **Library**: `LibMPT.sol` implements actual Merkle Patricia Trie traversal (Branch, Extension, Leaf nodes) and Keccak256 hash-chain verification.
 - **Decoding**: `RLPReader.sol` is used to decode the Ethereum receipt, ensuring the `Locked` or `Burned` event signature and emitter address are valid before minting/unlocking assets.
 - **Node Hashing**: Every intermediate hash in the proof MUST match the child pointer of the previous node, starting from the `trustedEthRoot`.

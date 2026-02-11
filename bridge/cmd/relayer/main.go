@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/big"
 	"os"
 	"os/signal"
 	"syscall"
@@ -240,7 +241,7 @@ func processCosmosEvent(tmTxHash string) {
 	fmt.Printf("✅ Cosmos Event found! Type=%s, Recipient=%s, Amount=%s\n", map[bool]string{true: "Lock", false: "Burn"}[isMint], recipient, amount.String())
 
 	outputPath := "proof_event.json"
-	root, actualTx, err := prover.GenerateProof(CosmosRpcUrl, tmTxHash, outputPath)
+	_, actualTx, err := prover.GenerateProof(CosmosRpcUrl, tmTxHash, outputPath)
 	if err != nil {
 		fmt.Printf("❌ ZK Proof generation failed: %v\n", err)
 		return
@@ -249,12 +250,43 @@ func processCosmosEvent(tmTxHash string) {
 	hUint64 := uint64(0)
 	fmt.Sscanf(resp.Result.Height, "%d", &hUint64)
 
-	// In a real production relayer, you'd check if height > lastProcessedHeight on Eth
-	// and submit GenerateValidatorProof if needed.
-	// For this POC demonstration:
-	fmt.Printf("🔄 Synchronizing Header for height %d on Ethereum (Anchoring to %x)...\n", hUint64, root)
-	// prover.SubmitHeaderProof(...) would be called here.
+	// 4. Ensure the block header is synchronized on Ethereum
+	ethClient := rpc.NewEthClient(EthereumRpcUrl)
+	existingRoot, _ := ethClient.GetTrustedRoot(BridgeEthAddr, hUint64)
+	if existingRoot != [32]byte{} {
+		fmt.Printf("ℹ️ Header for height %d already anchored on Ethereum. Skipping sync.\n", hUint64)
+	} else {
+		fmt.Printf("🔄 Synchronizing Header for height %d on Ethereum (Anchoring DataHash)...\n", hUint64)
+		headerProofPath := fmt.Sprintf("proof_header_%d.json", hUint64)
+		err = prover.GenerateValidatorProof(CosmosRpcUrl, fmt.Sprintf("%d", hUint64), headerProofPath)
+		if err != nil {
+			fmt.Printf("❌ Failed to generate header proof: %v\n", err)
+			return
+		}
 
+		// Fetch metadata needed for verification
+		cosmosClient = rpc.NewCosmosClient(CosmosRpcUrl)
+		commitResp, _ := cosmosClient.GetCommit(fmt.Sprintf("%d", hUint64))
+		valResp, _ := cosmosClient.GetValidators(fmt.Sprintf("%d", hUint64))
+		bHashSlice, _ := rpc.DecodeHash(commitResp.Result.SignedHeader.Header.AppHash)
+		dHashSlice, _ := rpc.DecodeHash(commitResp.Result.SignedHeader.Header.DataHash)
+
+		var bHash [32]byte
+		var dHash [32]byte
+		copy(bHash[:], bHashSlice)
+		copy(dHash[:], dHashSlice)
+
+		var totalPower big.Int
+		totalPower.SetString(valResp.Result.Total, 10)
+
+		err = prover.SubmitHeaderProof(EthereumRpcUrl, RelayerPrivKey, BridgeEthAddr, hUint64, bHash, dHash, &totalPower, headerProofPath)
+		if err != nil {
+			fmt.Printf("❌ Header sync failed: %v\n", err)
+			return
+		}
+	}
+
+	// 5. Submit Transaction Proof
 	err = prover.SubmitProof(EthereumRpcUrl, RelayerPrivKey, BridgeEthAddr, hUint64, recipient, amount, actualTx, outputPath, isMint)
 	if err != nil {
 		fmt.Printf("❌ ZK Proof submission failed: %v\n", err)
