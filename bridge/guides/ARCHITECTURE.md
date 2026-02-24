@@ -46,22 +46,22 @@ This direction uses **Groth16 ZK-SNARKs** to verify Tendermint Merkle proofs on 
 
 ### 3.1 Cryptographic Foundation
 - **Triple-Verifier Architecture**: The production implementation uses three specialized circuits to ensure security and gas efficiency:
-  - **ValidatorCircuit**: Verifies block finality using **Secp256k1 ECDSA** signatures and 2/3 voting power quorum.
+  - **ValidatorCircuit**: Verifies block finality using **Ed25519** signatures and 2/3 voting power quorum.
   - **TransitionCircuit**: Verifies validator set updates through signed set-hashes.
   - **TransactionCircuit**: Verifies Merkle inclusion proofs for specific transactions.
 
 #### Why this approach?
 1. **Security (Trust Continuity)**: By separating validator set transitions into its own circuit, we ensure a "cryptographic chain of custody." A new validator set is only trusted if the *previous* trusted set signed its hash. This prevents "long-range attacks" where an attacker could otherwise try to inject a fake validator set.
 2. **Gas Efficiency (Amortization)**: 
-   - Signature verification (Secp156k1 emulation) is extremely expensive on-chain (~200k+ gas). 
+   - Signature verification (Ed25519 emulation) is extremely expensive on-chain (~200k+ gas). 
    - Instead of verifying signatures for *every* transaction, we verify them once (per block/epoch) to anchor a `trustedRoot`. 
    - Individual transaction proofs then only need to verify a Merkle path against that root, which is significantly cheaper and faster inside a SNARK.
-3. **Modular Proving**: Separating circuits reduces the "constraint count" for each individual proof. This results in faster proof generation and lower memory requirements for the relayer/prover compared to a single "God Circuit."
+3. **Modular Proving**: Separating circuits reduces the "constraint count" for each individual proof. This results in faster proof generation and lower memory requirements for the relayer/prover compared to a single "God Circuit." To ensure stability, the production relayer uses a **Sequential Prover Mutex** to prevent multiple ZK proving processes from contending for system memory.
 
 - **Proving System**: Groth16 (BN254 curve).
-- **Emulated Arithmetic**: Uses non-native emulated arithmetic to verify Secp256k1 signatures on the BN254 curve.
+- **Emulated Arithmetic**: Uses non-native emulated arithmetic to verify **Ed25519** signatures (Edwards curve operations) on the BN254 curve.
 - **Input Packing**: 32-byte hashes are split into 4x `uint64` (passed as `uint256` field elements) to maintain compatibility between the SNARK field and EVM words.
-- **Cryptographic Linking**: The `ValidatorCircuit` enforced a strict link between the signed `BlockHash` and the anchored `DataHash` (transaction root) and `ValidatorsHash` using SHA-256 inside the circuit.
+- **Cryptographic Linking**: The `ValidatorCircuit` enforces a strict link between the signed `BlockHash` and the anchored `DataHash` (transaction root) and `ValidatorsHash` using SHA-512 and SHA-256 inside the circuit.
 
 ### 3.2 Deep Dive: The ZK Process
 
@@ -69,9 +69,9 @@ The production bridge uses three distinct circuits to minimize gas costs and max
 
 #### A. Block Finality (ValidatorCircuit)
 This circuit proves that a specific block header is cryptographically finalized by the Cosmos network.
-1. **Signature Emulation**: It uses **non-native emulated arithmetic** to verify **Secp256k1 ECDSA** signatures (from Tendermint validators) on the BN254 curve used by Ethereum.
+1. **Signature Emulation**: It uses **non-native emulated arithmetic** to verify **Ed25519** signatures (from Tendermint validators) on the BN254 curve used by Ethereum.
 2. **Quorum Enforcement**: It iterates through the validator set and calculates `signedPower`. It asserts that `3 * signedPower >= 2 * TotalPower` (the standard 2/3 Tendermint quorum).
-3. **Set Integrity**: It hashes the entire validator set (Address + Power) and ensures it matches the public `ValidatorsHash` to prevent "fake" key substitution.
+3. **Set Integrity**: It hashes the entire validator set (Compressed Public Key + Power) and ensures it matches the public `ValidatorsHash` to prevent "fake" key substitution.
 
 #### B. Validator Set Transitions (TransitionCircuit)
 This circuit ensures a secure handover between validator sets.

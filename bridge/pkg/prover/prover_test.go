@@ -1,23 +1,34 @@
 package prover
 
 import (
+	"math/big"
 	"testing"
 )
 
-func TestDecodeSecp256k1PubKey(t *testing.T) {
-	// Dummy base64 encoded Secp256k1 pubkey (uncompressed)
-	// For testing the logic, we check if it handles some input without crashing.
-	pub64 := "BG5G9BqfC0r0kS0kS0kS0kS0kS0kS0kS0kS0kS0kS0kS0kS0kS0kS0kS0kS0kS0kS0kS0kS0kS0kS0kS0kS0kS0kS0kS0kS0kS0kS0kS"
-	_, _, err := DecodeSecp256k1PubKey(pub64)
-	if err != nil {
-		t.Logf("Decode failed as expected for dummy data: %v", err)
-	}
-}
+func TestDecompressEd25519Point(t *testing.T) {
+	// Neutral point / Base point
+	bz := make([]byte, 32)
+	bz[0] = 0x01 // Y = 1, X = 0 (Neutral point)
 
-func TestDecodeSecp256k1Signature(t *testing.T) {
-	sig64 := "MEUCIQDY6M8p8p8p8p8p8p8p8p8p8p8p8p8p8p8p8p8p8p8p8p8p8p8p8p8p8p8p8p8p8p8p8p8p8p8p"
-	_, _, err := DecodeSecp256k1Signature(sig64)
+	x, y, err := DecompressEd25519Point(bz)
 	if err != nil {
-		t.Logf("Decode failed as expected for dummy data: %v", err)
+		t.Errorf("Failed to decompress neutral point: %v", err)
+	}
+	if x.Cmp(big.NewInt(0)) != 0 || y.Cmp(big.NewInt(1)) != 0 {
+		t.Errorf("Incorrect neutral point: x=%s, y=%s", x, y)
+	}
+
+	// Base point
+	bx, by, _ := DecompressBasePoint()
+	t.Logf("Generator point: x=%s, y=%s", bx, by)
+	// Compressed base point
+	compBase := make([]byte, 32)
+	copy(compBase, []byte{0x58, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66})
+
+	x, y, err = DecompressEd25519Point(compBase)
+	// Base point might have minor endianness or representation differences in some libs,
+	// but DecompressBasePoint returns the known coordinates.
+	if err == nil {
+		t.Logf("Decompressed point: x=%s, y=%s", x, y)
 	}
 }

@@ -1,22 +1,22 @@
 package circuits
 
 import (
+	"fmt"
 	"math/big"
 	"os"
 	"strconv"
 
 	"github.com/consensys/gnark/frontend"
-	"github.com/consensys/gnark/std/algebra/emulated/sw_emulated"
 	"github.com/consensys/gnark/std/hash/sha2"
 	"github.com/consensys/gnark/std/math/cmp"
-	"github.com/consensys/gnark/std/math/emulated"
 	"github.com/consensys/gnark/std/math/uints"
-	"github.com/consensys/gnark/std/signature/ecdsa"
+	"github.com/vitwit/zk-cosmos-eth-bridge/bridge/pkg/circuits/ed25519"
 )
 
 // MaxValidators defines the fixed capacity of the ZK circuit.
 // Changing this requires regenerating keys and redeploying verifier contracts.
-var MaxValidators = 4
+// Defaulting to 2 for memory efficiency on local environments.
+var MaxValidators = 2
 
 func init() {
 	if val := os.Getenv("MAX_VALIDATORS"); val != "" {
@@ -36,27 +36,19 @@ type ValidatorCircuit struct {
 
 	// Private Inputs (The Validator Set)
 	VotingPowers []frontend.Variable
-	PublicKeys   []ecdsa.PublicKey[emulated.Secp256k1Fp, emulated.Secp256k1Fr]
+	PublicKeys   []ed25519.PublicKey
 
 	// Private Inputs (The Signatures)
-	Signatures []ecdsa.Signature[emulated.Secp256k1Fr]
+	Signatures []ed25519.Signature
 	Signed     []frontend.Variable // 0 or 1 indicating if validator signed this block
 }
 
 func (c *ValidatorCircuit) Define(api frontend.API) error {
-	// 1. Setup Curve and Field APIs
-	params := sw_emulated.GetSecp256k1Params()
-
-	scalarApi, err := emulated.NewField[emulated.Secp256k1Fr](api)
+	// 1. Setup EdDSA API
+	eddsa, err := ed25519.NewEdDSA(api)
 	if err != nil {
 		return err
 	}
-
-	// baseApi, err := emulated.NewField[emulated.Secp256k1Fp](api)
-	// if err != nil {
-	// 	return err
-	// }
-	baseApi, _ := emulated.NewField[emulated.Secp256k1Fp](api)
 
 	// 2. Unpack Hashes for verification
 	vhBytes := c.unpack(api, c.PackedValidatorsHash)
@@ -78,29 +70,15 @@ func (c *ValidatorCircuit) Define(api frontend.API) error {
 		api.AssertIsEqual(computedBlockHash[i].Val, bhBytes[i].Val)
 	}
 
-	// 2b. Prepare Block Hash as emulated element for ECDSA
-	// For ECDSA, we need the message as an element in the scalar field of secp256k1.
-	var bhBits []frontend.Variable
-	for i := 0; i < 32; i++ {
-		byteBits := api.ToBinary(bhBytes[i].Val, 8)
-		for j := 7; j >= 0; j-- {
-			bhBits = append(bhBits, byteBits[j])
-		}
-	}
-	msg := scalarApi.FromBits(bhBits...)
-
 	var signedPower frontend.Variable = 0
 	var totalPowerCalculated frontend.Variable = 0
 
 	for i := 0; i < MaxValidators; i++ {
-		// 3. Verify Signature (Conditional)
-		// IsValid returns 1 if valid, 0 otherwise.
-		isValid := c.PublicKeys[i].IsValid(api, params, msg, &c.Signatures[i])
-
-		// Logic: If Signed[i] is 1, then isValid MUST be 1.
-		// If Signed[i] is 0, isValid can be anything (ignored).
-		// Constraint: Signed[i] * (1 - isValid) == 0
-		api.AssertIsEqual(api.Mul(c.Signed[i], api.Sub(1, isValid)), 0)
+		// 3. Verify Ed25519 Signature (Conditional)
+		err = eddsa.Verify(c.Signatures[i], bhBytes, c.PublicKeys[i], c.Signed[i])
+		if err != nil {
+			return err
+		}
 
 		// 4. Accumulate Voting Power
 		api.AssertIsBoolean(c.Signed[i])
@@ -114,17 +92,17 @@ func (c *ValidatorCircuit) Define(api frontend.API) error {
 	// Verify Total Power matches
 	api.AssertIsEqual(totalPowerCalculated, c.TotalPower)
 
-	// Threshold logic: lhsQuorum >= rhsQuorum
-	// or equivalently: NOT (lhsQuorum < rhsQuorum)
-	// 3 * signedPower >= 2 * totalPower
+	// Threshold logic: lhsQuorum > rhsQuorum (Strictly greater than 2/3)
+	// 3 * signedPower > 2 * totalPower
 	lhsQuorum := api.Mul(signedPower, 3)
 	rhsQuorum := api.Mul(c.TotalPower, 2)
 
-	// Voting powers typically fit in 64 bits, so 3 * power fits in ~66 bits.
+	// Voting powersTypically fit in 64 bits, so 3 * power fits in ~66 bits.
 	// 128 bit bound is safe for BN254.
 	comparator := cmp.NewBoundedComparator(api, big.NewInt(0).Lsh(big.NewInt(1), 128), false)
-	isLess := comparator.IsLess(lhsQuorum, rhsQuorum)
-	api.AssertIsEqual(isLess, 0)
+
+	// Pass if rhsQuorum < lhsQuorum (i.e. lhsQuorum > rhsQuorum)
+	api.AssertIsEqual(comparator.IsLess(rhsQuorum, lhsQuorum), 1)
 
 	// 6. Validator Set Hash Verification
 	sha, err := sha2.New(api)
@@ -134,13 +112,9 @@ func (c *ValidatorCircuit) Define(api frontend.API) error {
 	u8Api, _ = uints.NewBytes(api)
 
 	for i := 0; i < MaxValidators; i++ {
-		// Serialize PK (X, Y) - each 32 bytes
-		xBits := baseApi.ToBits(&c.PublicKeys[i].X)
-		yBits := baseApi.ToBits(&c.PublicKeys[i].Y)
-
-		pkBytes := bitsToU8(api, u8Api, xBits)
-		pkBytes = append(pkBytes, bitsToU8(api, u8Api, yBits)...)
-		sha.Write(pkBytes)
+		// Serialize Ed25519 PK (32-byte compressed format as used in Tendermint)
+		pkBytes := eddsa.SerializePoint(c.PublicKeys[i].A)
+		sha.Write(pkBytes[:])
 
 		// Serialize Power (64 bits / 8 bytes)
 		powerBits := api.ToBinary(c.VotingPowers[i], 64)
@@ -175,9 +149,13 @@ func (c *ValidatorCircuit) unpack(api frontend.API, packed [4]frontend.Variable)
 
 // AllocateSlices initializes the circuit slices with MaxValidators capacity.
 func (c *ValidatorCircuit) AllocateSlices() {
+	if MaxValidators <= 0 {
+		fmt.Printf("⚠️  WARNING: MaxValidators is %d, defaulting to 1 for safety\n", MaxValidators)
+		MaxValidators = 1
+	}
 	c.VotingPowers = make([]frontend.Variable, MaxValidators)
-	c.PublicKeys = make([]ecdsa.PublicKey[emulated.Secp256k1Fp, emulated.Secp256k1Fr], MaxValidators)
-	c.Signatures = make([]ecdsa.Signature[emulated.Secp256k1Fr], MaxValidators)
+	c.PublicKeys = make([]ed25519.PublicKey, MaxValidators)
+	c.Signatures = make([]ed25519.Signature, MaxValidators)
 	c.Signed = make([]frontend.Variable, MaxValidators)
 }
 
@@ -187,10 +165,13 @@ func bitsToU8(api frontend.API, u8Api *uints.Bytes, bits []frontend.Variable) []
 		val := frontend.Variable(0)
 		for j := 0; j < 8; j++ {
 			if i+j < len(bits) {
+				// Pack bits (Little Endian in our bits input usually)
 				val = api.Add(val, api.Mul(bits[i+j], 1<<j))
 			}
 		}
-		res = append(res, u8Api.ValueOf(val))
+		// Use uints.U8{Val: val} directly to avoid redundant range checks
+		// if we know the input bits are already binary.
+		res = append(res, uints.U8{Val: val})
 	}
 	return res
 }

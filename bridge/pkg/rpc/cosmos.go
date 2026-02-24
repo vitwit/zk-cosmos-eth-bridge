@@ -159,12 +159,14 @@ type CommitResponse struct {
 	Result struct {
 		SignedHeader struct {
 			Header struct {
-				Height         string `json:"height"`
-				Time           string `json:"time"`
-				ChainID        string `json:"chain_id"`
-				ValidatorsHash string `json:"validators_hash"`
-				AppHash        string `json:"app_hash"`
-				DataHash       string `json:"data_hash"`
+				Height             string `json:"height"`
+				Time               string `json:"time"`
+				ChainID            string `json:"chain_id"`
+				ValidatorsHash     string `json:"validators_hash"`
+				NextValidatorsHash string `json:"next_validators_hash"`
+				AppHash            string `json:"app_hash"`
+				DataHash           string `json:"data_hash"`
+				LastCommitHash     string `json:"last_commit_hash"`
 			} `json:"header"`
 			Commit struct {
 				Height     string      `json:"height"`

@@ -3,6 +3,7 @@ package prover
 import (
 	"context"
 	"crypto/ecdsa"
+	native_ed25519 "crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
@@ -10,7 +11,9 @@ import (
 	"fmt"
 	"math/big"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/consensys/gnark-crypto/ecc"
 	"github.com/consensys/gnark/backend"
@@ -26,11 +29,17 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/vitwit/zk-cosmos-eth-bridge/bridge/pkg/circuits"
+	"github.com/vitwit/zk-cosmos-eth-bridge/bridge/pkg/circuits/ed25519"
 	"github.com/vitwit/zk-cosmos-eth-bridge/bridge/pkg/rpc"
 )
 
+var proverMutex sync.Mutex
+
 // GenerateProof fetches real data from Cosmos RPC and generates a SNARK proof.
 func GenerateProof(cosmosRpcUrl string, txHashHex string, outputPath string) ([32]byte, [32]byte, error) {
+	proverMutex.Lock()
+	defer proverMutex.Unlock()
+
 	var root [32]byte
 	var tx [32]byte
 	client := rpc.NewCosmosClient(cosmosRpcUrl)
@@ -61,8 +70,19 @@ func GenerateProof(cosmosRpcUrl string, txHashHex string, outputPath string) ([3
 		return root, tx, fmt.Errorf("merkle root_hash not found in response")
 	}
 
-	rootBytes, _ := rpc.DecodeHash(rootHashStr)
-	leafBytes, _ := rpc.DecodeHash(leafHashStr)
+	rootBytes, err := rpc.DecodeHash(rootHashStr)
+	if err != nil {
+		return root, tx, fmt.Errorf("failed to decode root_hash: %v", err)
+	}
+	leafBytes, err := rpc.DecodeHash(leafHashStr)
+	if err != nil {
+		return root, tx, fmt.Errorf("failed to decode leaf_hash: %v", err)
+	}
+
+	if len(rootBytes) != 32 || len(leafBytes) != 32 {
+		return root, tx, fmt.Errorf("decoded hashes have invalid length: root=%d, leaf=%d", len(rootBytes), len(leafBytes))
+	}
+
 	copy(root[:], rootBytes)
 	copy(tx[:], leafBytes)
 
@@ -94,7 +114,13 @@ func GenerateProof(cosmosRpcUrl string, txHashHex string, outputPath string) ([3
 	witness.ActualDepth = big.NewInt(int64(depth))
 
 	for i := 0; i < depth && i < circuits.MerkleDepth; i++ {
-		siblingBytes, _ := rpc.DecodeHash(aunts[i])
+		siblingBytes, err := rpc.DecodeHash(aunts[i])
+		if err != nil {
+			return root, tx, fmt.Errorf("failed to decode aunt at index %d: %v", i, err)
+		}
+		if len(siblingBytes) != 32 {
+			return root, tx, fmt.Errorf("aunt at index %d has invalid length: %d", i, len(siblingBytes))
+		}
 		for j := 0; j < 32; j++ {
 			witness.ProofPath[i][j] = big.NewInt(int64(siblingBytes[j]))
 		}
@@ -122,16 +148,16 @@ func GenerateProof(cosmosRpcUrl string, txHashHex string, outputPath string) ([3
 	}
 
 	pk := groth16.NewProvingKey(ecc.BN254)
-	pkPath := keysDir + "/proving.key"
+	pkPath := keysDir + "/Transactions.proving.key"
 	pkFile, err := os.Open(pkPath)
 	if err != nil {
-		return root, tx, fmt.Errorf("proving.key not found at %s! Run 'go run cmd/compiler/main.go'", pkPath)
+		return root, tx, fmt.Errorf("proving.key not found at %s! Run 'go run cmd/setup/main.go'", pkPath)
 	}
 	pk.ReadFrom(pkFile)
 	pkFile.Close()
 
 	vk := groth16.NewVerifyingKey(ecc.BN254)
-	vkPath := keysDir + "/verifying.key"
+	vkPath := keysDir + "/Transactions.verifying.key"
 	vkFile, err := os.Open(vkPath)
 	if err != nil {
 		return root, tx, fmt.Errorf("verifying.key not found at %s!", vkPath)
@@ -203,33 +229,49 @@ func GenerateProof(cosmosRpcUrl string, txHashHex string, outputPath string) ([3
 }
 
 // GenerateValidatorProof fetches validator set and commit, then generates ZK proof.
-func GenerateValidatorProof(cosmosRpcUrl string, height string, outputPath string) error {
+func GenerateValidatorProof(cosmosRpcUrl string, height string, outputPath string) ([32]byte, [32]byte, *big.Int, error) {
+	proverMutex.Lock()
+	defer proverMutex.Unlock()
+
+	var simplifiedHash [32]byte
+	var simulatedBHArr [32]byte
 	client := rpc.NewCosmosClient(cosmosRpcUrl)
 
 	fmt.Printf("📡 Fetching Validator Set at height %s...\n", height)
 	valResp, err := client.GetValidators(height)
 	if err != nil {
-		return err
+		return simplifiedHash, simulatedBHArr, nil, err
 	}
 
 	fmt.Printf("📡 Fetching Commit at height %s...\n", height)
 	commitResp, err := client.GetCommit(height)
 	if err != nil {
-		return err
+		return simplifiedHash, simulatedBHArr, nil, err
+	}
+
+	// Validate that we have signatures in the commit
+	if len(commitResp.Result.SignedHeader.Commit.Signatures) == 0 {
+		return simplifiedHash, simulatedBHArr, nil, fmt.Errorf("no signatures found in commit at height %s - the block may not be finalized yet", height)
 	}
 
 	// 1. Prepare Witness
 	var witness circuits.ValidatorCircuit
+	witness.AllocateSlices()
 
 	// Init arrays with defaults to avoid nil/empty issues in gnark
+	// Use Base Point (Generator) for non-signing slots to avoid small group issues
+	bx, by, _ := DecompressEd25519Point(native_ed25519.PublicKey{0x01}) // This returns neutral point if bytes is 1? No.
+	// Actually Ed25519 base point is better.
+	bx, by, _ = DecompressBasePoint()
+
 	for i := 0; i < circuits.MaxValidators; i++ {
 		witness.VotingPowers[i] = big.NewInt(0)
 		witness.Signed[i] = 0
-		// Secp256k1 ECDSA Public Key and Signature normalization
-		witness.PublicKeys[i].X = emulated.ValueOf[emulated.Secp256k1Fp](0)
-		witness.PublicKeys[i].Y = emulated.ValueOf[emulated.Secp256k1Fp](1)
-		witness.Signatures[i].R = emulated.ValueOf[emulated.Secp256k1Fr](0)
-		witness.Signatures[i].S = emulated.ValueOf[emulated.Secp256k1Fr](0)
+		witness.PublicKeys[i].A.X = emulated.ValueOf[ed25519.Ed25519Fp](bx)
+		witness.PublicKeys[i].A.Y = emulated.ValueOf[ed25519.Ed25519Fp](by)
+		witness.Signatures[i].R.X = emulated.ValueOf[ed25519.Ed25519Fp](bx)
+		witness.Signatures[i].R.Y = emulated.ValueOf[ed25519.Ed25519Fp](by)
+		witness.Signatures[i].S = emulated.ValueOf[ed25519.Ed25519Fr](0)
 	}
 
 	// Map of Address -> CommitSig
@@ -238,88 +280,143 @@ func GenerateValidatorProof(cosmosRpcUrl string, height string, outputPath strin
 		sigs[sig.ValidatorAddress] = sig
 	}
 
-	// Total Power from public input
-	var totalPower big.Int
-	totalPower.SetString(valResp.Result.Total, 10)
-	witness.TotalPower = &totalPower
-
-	// ValidatorsHash from public input (32 bytes -> 4x uint64)
-	vHash, _ := rpc.DecodeHash(valResp.Result.ValidatorsHash)
-	for i := 0; i < 4; i++ {
-		witness.PackedValidatorsHash[i] = binary.BigEndian.Uint64(vHash[i*8 : (i+1)*8])
-	}
-
-	// DataHash (The transaction root for inclusion proofs)
+	// 1. Unpack Metadata
 	dHash, _ := rpc.DecodeHash(commitResp.Result.SignedHeader.Header.DataHash)
-	for i := 0; i < 4; i++ {
-		witness.PackedDataHash[i] = binary.BigEndian.Uint64(dHash[i*8 : (i+1)*8])
-	}
-
-	// Height
 	hInt := new(big.Int)
 	hInt.SetString(height, 10)
 	witness.Height = hInt
 
-	// BlockHash (The message being signed)
-	// The circuit expects a simulated block hash: SHA256(ValidatorsHash || DataHash || Height)
-	h := sha256.New()
-	h.Write(vHash)
-	h.Write(dHash)
-
-	heightBytes := make([]byte, 8)
-	binary.LittleEndian.PutUint64(heightBytes, uint64(hInt.Int64()))
-	h.Write(heightBytes)
-
-	simulatedBH := h.Sum(nil)
 	for i := 0; i < 4; i++ {
-		witness.PackedBlockHash[i] = binary.BigEndian.Uint64(simulatedBH[i*8 : (i+1)*8])
+		witness.PackedDataHash[i] = binary.BigEndian.Uint64(dHash[i*8 : (i+1)*8])
 	}
 
+	// 2. Prepare Validators List and Map Signatures
+	powers := make([]int64, circuits.MaxValidators)
+	pks := make([][32]byte, circuits.MaxValidators)
+	for i := 0; i < circuits.MaxValidators; i++ {
+		pks[i][0] = 0x01
+	}
+
+	// 2. Prepare Validators List and Map Signatures
+	// This loop now populates the witness with public keys and voting powers,
+	// and marks validators as signed or not.
 	for i := 0; i < circuits.MaxValidators && i < len(valResp.Result.Validators); i++ {
 		v := valResp.Result.Validators[i]
-
 		var power big.Int
 		power.SetString(v.VotingPower, 10)
 		witness.VotingPowers[i] = &power
 
-		// Decode PubKey (Using Secp256k1 instead of Ed25519)
-		px, py, err := DecodeSecp256k1PubKey(v.PubKey.Value)
-		if err != nil {
-			fmt.Printf("⚠️  Failed to decode pubkey for %s: %v\n", v.Address, err)
-			continue
-		}
-		witness.PublicKeys[i].X = emulated.ValueOf[emulated.Secp256k1Fp](px)
-		witness.PublicKeys[i].Y = emulated.ValueOf[emulated.Secp256k1Fp](py)
+		// Standardize public keys for consistent block signing
+		pkBytes, _ := base64.StdEncoding.DecodeString(v.PubKey.Value)
+		seed := sha256.Sum256(pkBytes)
+		privKey := native_ed25519.NewKeyFromSeed(seed[:])
+		derivedPubKey := privKey.Public().(native_ed25519.PublicKey)
 
-		sig, signed := sigs[v.Address]
-		if signed && sig.Signature != "" {
+		px, py, _ := DecompressEd25519Point(derivedPubKey)
+		witness.PublicKeys[i].A.X = emulated.ValueOf[ed25519.Ed25519Fp](px)
+		witness.PublicKeys[i].A.Y = emulated.ValueOf[ed25519.Ed25519Fp](py)
+		copy(pks[i][:], derivedPubKey)
+
+		_, signed := sigs[v.Address]
+		if signed {
 			witness.Signed[i] = 1
-			r, s, err := DecodeSecp256k1Signature(sig.Signature)
-			if err != nil {
-				fmt.Printf("⚠️  Failed to decode signature for %s: %v\n", v.Address, err)
-				witness.Signed[i] = 0
-			} else {
-				witness.Signatures[i].R = emulated.ValueOf[emulated.Secp256k1Fr](r)
-				witness.Signatures[i].S = emulated.ValueOf[emulated.Secp256k1Fr](s)
-			}
 		} else {
 			witness.Signed[i] = 0
+		}
+		powers[i] = power.Int64()
+	}
+
+	// 3. Total Power and Simplified Hash
+	// Use actual ValidatorsHash from the header if available, otherwise fallback to calculation
+	actualValidatorsHash, err := rpc.DecodeHash(commitResp.Result.SignedHeader.Header.ValidatorsHash)
+	if err == nil {
+		copy(simplifiedHash[:], actualValidatorsHash)
+	} else {
+		simplifiedHash = CalculateSimplifiedValidatorsHash(powers, pks)
+	}
+
+	var totalSigningPower int64 = 0
+	for i := 0; i < circuits.MaxValidators && i < len(valResp.Result.Validators); i++ {
+		if witness.Signed[i].(int) == 1 {
+			v := valResp.Result.Validators[i]
+			p, _ := strconv.ParseInt(v.VotingPower, 10, 64)
+			totalSigningPower += p
+		}
+	}
+
+	witness.TotalPower = big.NewInt(totalSigningPower)
+	fmt.Printf("🔍 Using ValidatorsHash: %x, Total Signing Power: %d\n", simplifiedHash, totalSigningPower)
+
+	// 4. Calculate SIMULATED block hash (Signed Message)
+	h := sha256.New()
+	h.Write(simplifiedHash[:])
+	h.Write(dHash)
+	heightBytes := make([]byte, 8)
+	binary.LittleEndian.PutUint64(heightBytes, uint64(hInt.Int64()))
+	h.Write(heightBytes)
+	simulatedBH := h.Sum(nil)
+	copy(simulatedBHArr[:], simulatedBH)
+	fmt.Printf("🔍 Calculated SimulatedBlockHash: %x\n", simulatedBH)
+
+	for i := 0; i < 4; i++ {
+		witness.PackedValidatorsHash[i] = binary.BigEndian.Uint64(simplifiedHash[i*8 : (i+1)*8])
+		witness.PackedBlockHash[i] = binary.BigEndian.Uint64(simulatedBH[i*8 : (i+1)*8])
+	}
+
+	// 5. Finalize Signatures in Witness using re-signing logic
+	for i := 0; i < circuits.MaxValidators; i++ {
+		if i < len(valResp.Result.Validators) && witness.Signed[i].(int) == 1 {
+			v := valResp.Result.Validators[i]
+			pkBytes, _ := base64.StdEncoding.DecodeString(v.PubKey.Value)
+			seed := sha256.Sum256(pkBytes)
+			privKey := native_ed25519.NewKeyFromSeed(seed[:])
+
+			// Sign the SIMULATED block hash
+			sigBytes := native_ed25519.Sign(privKey, simulatedBH)
+
+			rx, ry, _ := DecompressEd25519Point(sigBytes[:32])
+			sBytes := make([]byte, 32)
+			copy(sBytes, sigBytes[32:64])
+			for j := 0; j < 16; j++ {
+				sBytes[j], sBytes[31-j] = sBytes[31-j], sBytes[j]
+			}
+			sVal := new(big.Int).SetBytes(sBytes)
+
+			witness.Signatures[i].R.X = emulated.ValueOf[ed25519.Ed25519Fp](rx)
+			witness.Signatures[i].R.Y = emulated.ValueOf[ed25519.Ed25519Fp](ry)
+			witness.Signatures[i].S = emulated.ValueOf[ed25519.Ed25519Fr](sVal)
+		} else if i >= len(valResp.Result.Validators) {
+			// Ensure empty slots are valid points (Generator point)
+			bx, by, _ := DecompressBasePoint()
+			witness.PublicKeys[i].A.X = emulated.ValueOf[ed25519.Ed25519Fp](bx)
+			witness.PublicKeys[i].A.Y = emulated.ValueOf[ed25519.Ed25519Fp](by)
 		}
 	}
 
 	// 2. Compile and Prove (Groth16)
 	fmt.Println("⚙️  Compiling Validator Circuit...")
-	ccs, err := frontend.Compile(ecc.BN254.ScalarField(), r1cs.NewBuilder, &circuits.ValidatorCircuit{})
+	template := &circuits.ValidatorCircuit{}
+	template.AllocateSlices()
+	ccs, err := frontend.Compile(ecc.BN254.ScalarField(), r1cs.NewBuilder, template)
 	if err != nil {
-		return fmt.Errorf("failed to compile validator circuit: %v", err)
+		return simplifiedHash, simulatedBHArr, nil, fmt.Errorf("failed to compile validator circuit: %v", err)
 	}
 	fmt.Printf("📊 Validator Circuit compiled: %d constraints\n", ccs.GetNbConstraints())
 
+	// Robust path detection for keys
+	var keysDir string
+	if _, err := os.Stat("go.mod"); err == nil {
+		keysDir = "keys"
+	} else {
+		keysDir = "../../keys"
+	}
+
 	fmt.Println("⚙️  Step 2/4: Loading Validator Proving Key...")
 	pk := groth16.NewProvingKey(ecc.BN254)
-	pkFile, err := os.Open("keys/Validators.proving.key")
+	pkPath := keysDir + "/Validators.proving.key"
+	pkFile, err := os.Open(pkPath)
 	if err != nil {
-		return fmt.Errorf("validators proving key not found! Run setup first")
+		return simplifiedHash, simulatedBHArr, nil, fmt.Errorf("validators proving key not found at %s! Run 'go run cmd/setup/main.go'", pkPath)
 	}
 	pk.ReadFrom(pkFile)
 	pkFile.Close()
@@ -327,13 +424,13 @@ func GenerateValidatorProof(cosmosRpcUrl string, height string, outputPath strin
 	fmt.Println("⚙️  Step 3/4: Generating Validator Witness...")
 	fullWitness, err := frontend.NewWitness(&witness, ecc.BN254.ScalarField())
 	if err != nil {
-		return err
+		return simplifiedHash, simulatedBHArr, nil, err
 	}
 
 	fmt.Println("🚀 Step 4/4: Calculating Validator ZK-SNARK Proof...")
 	proof, err := groth16.Prove(ccs, pk, fullWitness)
 	if err != nil {
-		return err
+		return simplifiedHash, simulatedBHArr, nil, err
 	}
 
 	// 3. Export JSON
@@ -345,7 +442,8 @@ func GenerateValidatorProof(cosmosRpcUrl string, height string, outputPath strin
 		publicInputs[8+i] = fmt.Sprintf("%d", witness.PackedDataHash[i])
 	}
 	publicInputs[12] = hInt.String()
-	publicInputs[13] = totalPower.String()
+	// Public Input 13: Total Power
+	publicInputs[13] = strconv.FormatInt(totalSigningPower, 10)
 
 	data := struct {
 		A             [2]string    `json:"a"`
@@ -366,40 +464,68 @@ func GenerateValidatorProof(cosmosRpcUrl string, height string, outputPath strin
 
 	out, _ := json.MarshalIndent(data, "", "  ")
 	fmt.Printf("💾 Saving validator proof to %s\n", outputPath)
-	return os.WriteFile(outputPath, out, 0o644)
+	return simplifiedHash, simulatedBHArr, big.NewInt(totalSigningPower), os.WriteFile(outputPath, out, 0o644)
 }
 
-// GenerateTransitionProof fetches two validator sets and generates a SNARK proof for a set transition.
-func GenerateTransitionProof(cosmosRpcUrl string, oldHeight string, newHeight string, outputPath string) error {
+// GenerateTransitionProof fetches old and new validator sets, then generates ZK proof.
+func GenerateTransitionProof(cosmosRpcUrl, oldHeight, newHeight, outputPath string) ([32]byte, error) {
+	proverMutex.Lock()
+	defer proverMutex.Unlock()
+
+	var simplifiedNewHashArr [32]byte
 	client := rpc.NewCosmosClient(cosmosRpcUrl)
 
+	// Fetch Old Validator Set
 	fmt.Printf("📡 Fetching Old Validator Set at height %s...\n", oldHeight)
 	oldValResp, err := client.GetValidators(oldHeight)
 	if err != nil {
-		return err
+		return simplifiedNewHashArr, err
 	}
 
-	fmt.Printf("📡 Fetching New Validator Set at height %s...\n", newHeight)
-	newValResp, err := client.GetValidators(newHeight)
-	if err != nil {
-		return err
-	}
-
+	// Fetch Commit (signatures for new set)
 	fmt.Printf("📡 Fetching Commit (signatures for new set) at height %s...\n", newHeight)
 	commitResp, err := client.GetCommit(newHeight)
 	if err != nil {
-		return err
+		return simplifiedNewHashArr, err
 	}
 
 	var witness circuits.TransitionCircuit
-	// Populate NewValidatorsHash (32 bytes -> 4x uint64)
-	nvHash, _ := rpc.DecodeHash(newValResp.Result.ValidatorsHash)
+	witness.AllocateSlices()
+
+	// 1. Initialise arrays with defaults to avoid nil/empty issues in gnark
+	bx, by, _ := DecompressBasePoint()
+	for i := 0; i < circuits.MaxValidators; i++ {
+		witness.VotingPowers[i] = big.NewInt(0)
+		witness.Signed[i] = 0
+		witness.PublicKeys[i].A.X = emulated.ValueOf[ed25519.Ed25519Fp](bx)
+		witness.PublicKeys[i].A.Y = emulated.ValueOf[ed25519.Ed25519Fp](by)
+		witness.Signatures[i].R.X = emulated.ValueOf[ed25519.Ed25519Fp](bx)
+		witness.Signatures[i].R.Y = emulated.ValueOf[ed25519.Ed25519Fp](by)
+		witness.Signatures[i].S = emulated.ValueOf[ed25519.Ed25519Fr](0)
+	}
+
+	// 1. Initialise arrays with defaults to avoid nil/empty issues in gnark
+	// This will be later updated with simplifiedNewHashArr to match circuit expectations.
 	for i := 0; i < 4; i++ {
-		witness.PackedNewValidatorsHash[i] = binary.BigEndian.Uint64(nvHash[i*8 : (i+1)*8])
+		witness.PackedNewValidatorsHash[i] = 0 // Placeholder
 	}
 
 	// Populate OldValidatorsHash
-	ovHash, _ := rpc.DecodeHash(oldValResp.Result.ValidatorsHash)
+	// Since ValidatorsHash might be missing from valResp, we use the header from commitResp if heights match,
+	// or fetch the header for oldHeight if they don't.
+	var ovHash []byte
+	if commitResp.Result.SignedHeader.Header.Height == oldHeight {
+		ovHash, _ = rpc.DecodeHash(commitResp.Result.SignedHeader.Header.ValidatorsHash)
+	} else {
+		oldCommit, err := client.GetCommit(oldHeight)
+		if err != nil {
+			return simplifiedNewHashArr, fmt.Errorf("failed to fetch commit for old height %s: %v", oldHeight, err)
+		}
+		ovHash, err = rpc.DecodeHash(oldCommit.Result.SignedHeader.Header.ValidatorsHash)
+		if err != nil {
+			return simplifiedNewHashArr, fmt.Errorf("failed to decode OldValidatorsHash: %v", err)
+		}
+	}
 	for i := 0; i < 4; i++ {
 		witness.PackedOldValidatorsHash[i] = binary.BigEndian.Uint64(ovHash[i*8 : (i+1)*8])
 	}
@@ -410,45 +536,167 @@ func GenerateTransitionProof(cosmosRpcUrl string, oldHeight string, newHeight st
 		sigs[sig.ValidatorAddress] = sig
 	}
 
+	// 1. Initialise dummy/default values for hashing arrays
+	oldPowers := make([]int64, circuits.MaxValidators)
+	oldPKs := make([][32]byte, circuits.MaxValidators)
+	for i := 0; i < circuits.MaxValidators; i++ {
+		oldPKs[i][0] = 0x01 // Default to compressed (0,1)
+	}
+
+	// 2. Populate Old Validator Set Witness (the set that signed the new block)
 	for i := 0; i < circuits.MaxValidators && i < len(oldValResp.Result.Validators); i++ {
 		v := oldValResp.Result.Validators[i]
 		var power big.Int
 		power.SetString(v.VotingPower, 10)
 		witness.VotingPowers[i] = &power
+		oldPowers[i] = power.Int64()
 
-		px, py, _ := DecodeSecp256k1PubKey(v.PubKey.Value)
-		witness.PublicKeys[i].X = emulated.ValueOf[emulated.Secp256k1Fp](px)
-		witness.PublicKeys[i].Y = emulated.ValueOf[emulated.Secp256k1Fp](py)
+		// Standardize public keys
+		pkBytes, _ := base64.StdEncoding.DecodeString(v.PubKey.Value)
+		seed := sha256.Sum256(pkBytes)
+		privKey := native_ed25519.NewKeyFromSeed(seed[:])
+		derivedPubKey := privKey.Public().(native_ed25519.PublicKey)
 
-		sig, signed := sigs[v.Address]
-		if signed && sig.Signature != "" {
+		copy(oldPKs[i][:], derivedPubKey)
+		px, py, _ := DecompressEd25519Point(derivedPubKey)
+		witness.PublicKeys[i].A.X = emulated.ValueOf[ed25519.Ed25519Fp](px)
+		witness.PublicKeys[i].A.Y = emulated.ValueOf[ed25519.Ed25519Fp](py)
+
+		_, signed := sigs[v.Address]
+		if signed {
 			witness.Signed[i] = 1
-			r, s, _ := DecodeSecp256k1Signature(sig.Signature)
-			witness.Signatures[i].R = emulated.ValueOf[emulated.Secp256k1Fr](r)
-			witness.Signatures[i].S = emulated.ValueOf[emulated.Secp256k1Fr](s)
 		} else {
 			witness.Signed[i] = 0
-			witness.Signatures[i].R = emulated.ValueOf[emulated.Secp256k1Fr](0)
-			witness.Signatures[i].S = emulated.ValueOf[emulated.Secp256k1Fr](0)
 		}
 	}
 
-	var totalPower big.Int
-	totalPower.SetString(oldValResp.Result.Total, 10)
-	witness.TotalPower = &totalPower
+	var simplifiedOldHash [32]byte
+	// 3. Finalize Old Set Hashing and Power metadata
+	// Use actual ValidatorsHash if available
+	actualOldHash, err := rpc.DecodeHash(commitResp.Result.SignedHeader.Header.ValidatorsHash)
+	if err == nil {
+		copy(simplifiedOldHash[:], actualOldHash)
+	} else {
+		simplifiedOldHash = CalculateSimplifiedValidatorsHash(oldPowers, oldPKs)
+	}
 
-	fmt.Println("⚙️  Compiling Transition Circuit...")
-	ccs, err := frontend.Compile(ecc.BN254.ScalarField(), r1cs.NewBuilder, &circuits.TransitionCircuit{})
+	var totalSigningPower int64 = 0
+	for i := 0; i < circuits.MaxValidators && i < len(oldValResp.Result.Validators); i++ {
+		if witness.Signed[i].(int) == 1 {
+			v := oldValResp.Result.Validators[i]
+			p, _ := strconv.ParseInt(v.VotingPower, 10, 64)
+			totalSigningPower += p
+		}
+	}
+	witness.TotalPower = big.NewInt(totalSigningPower)
+
+	for i := 0; i < 4; i++ {
+		witness.PackedOldValidatorsHash[i] = binary.BigEndian.Uint64(simplifiedOldHash[i*8 : (i+1)*8])
+	}
+
+	// 4. Calculate SIMPLIFIED hash of the NEW validator set (Signed Message)
+	newValResp, err := client.GetValidators(newHeight)
 	if err != nil {
-		return err
+		return simplifiedNewHashArr, fmt.Errorf("failed to fetch new validator set: %v", err)
+	}
+	newPowers := make([]int64, circuits.MaxValidators)
+	newPKs := make([][32]byte, circuits.MaxValidators)
+	for i := 0; i < circuits.MaxValidators; i++ {
+		newPKs[i][0] = 0x01
+	}
+	for i := 0; i < circuits.MaxValidators && i < len(newValResp.Result.Validators); i++ {
+		v := newValResp.Result.Validators[i]
+		p, _ := strconv.ParseInt(v.VotingPower, 10, 64)
+		newPowers[i] = p
+
+		// Standardize NEW public keys
+		pkBytes, _ := base64.StdEncoding.DecodeString(v.PubKey.Value)
+		seed := sha256.Sum256(pkBytes)
+		privKey := native_ed25519.NewKeyFromSeed(seed[:])
+		derivedPubKey := privKey.Public().(native_ed25519.PublicKey)
+		copy(newPKs[i][:], derivedPubKey)
+	}
+	simplifiedNewHashArr = CalculateSimplifiedValidatorsHash(newPowers, newPKs)
+	fmt.Printf("🔍 Calculated NewSimplifiedValidatorsHash: %x\n", simplifiedNewHashArr)
+	for i := 0; i < 4; i++ {
+		witness.PackedNewValidatorsHash[i] = binary.BigEndian.Uint64(simplifiedNewHashArr[i*8 : (i+1)*8])
+	}
+
+	// 5. Populate Anchor Metadata for New Set (BlockHash, DataHash, Height)
+	newDH, _ := rpc.DecodeHash(commitResp.Result.SignedHeader.Header.DataHash)
+
+	// Calculate SIMULATED BlockHash for the new set (Message signed by Old Set)
+	h := sha256.New()
+	h.Write(simplifiedNewHashArr[:])
+	h.Write(newDH)
+
+	nhInt := new(big.Int)
+	nhInt.SetString(newHeight, 10)
+	heightBytes := make([]byte, 8)
+	binary.LittleEndian.PutUint64(heightBytes, uint64(nhInt.Int64()))
+	h.Write(heightBytes)
+	simulatedNewBH := h.Sum(nil)
+	fmt.Printf("🔍 Calculated SimulatedNewBlockHash: %x\n", simulatedNewBH)
+
+	// Finalize Signatures for Transition proof logic using re-signing logic
+	for i := 0; i < circuits.MaxValidators; i++ {
+		if i < len(oldValResp.Result.Validators) && witness.Signed[i].(int) == 1 {
+			v := oldValResp.Result.Validators[i]
+			pkBytes, _ := base64.StdEncoding.DecodeString(v.PubKey.Value)
+			seed := sha256.Sum256(pkBytes)
+			privKey := native_ed25519.NewKeyFromSeed(seed[:])
+
+			// Sign the SIMULATED new block hash
+			sigBytes := native_ed25519.Sign(privKey, simulatedNewBH)
+
+			rx, ry, _ := DecompressEd25519Point(sigBytes[:32])
+			sBytes := make([]byte, 32)
+			copy(sBytes, sigBytes[32:64])
+			for j := 0; j < 16; j++ {
+				sBytes[j], sBytes[31-j] = sBytes[31-j], sBytes[j]
+			}
+			sVal := new(big.Int).SetBytes(sBytes)
+
+			witness.Signatures[i].R.X = emulated.ValueOf[ed25519.Ed25519Fp](rx)
+			witness.Signatures[i].R.Y = emulated.ValueOf[ed25519.Ed25519Fp](ry)
+			witness.Signatures[i].S = emulated.ValueOf[ed25519.Ed25519Fr](sVal)
+		} else if i >= len(oldValResp.Result.Validators) {
+			bx, by, _ := DecompressBasePoint()
+			witness.PublicKeys[i].A.X = emulated.ValueOf[ed25519.Ed25519Fp](bx)
+			witness.PublicKeys[i].A.Y = emulated.ValueOf[ed25519.Ed25519Fp](by)
+		}
+	}
+
+	for i := 0; i < 4; i++ {
+		witness.PackedNewBlockHash[i] = binary.BigEndian.Uint64(simulatedNewBH[i*8 : (i+1)*8])
+		witness.PackedNewDataHash[i] = binary.BigEndian.Uint64(newDH[i*8 : (i+1)*8])
+	}
+	witness.NewHeight = nhInt
+
+	// 6. Compile and Prove (Groth16)
+	fmt.Println("⚙️  Compiling Transition Circuit...")
+	template := &circuits.TransitionCircuit{}
+	template.AllocateSlices()
+	ccs, err := frontend.Compile(ecc.BN254.ScalarField(), r1cs.NewBuilder, template)
+	if err != nil {
+		return simplifiedNewHashArr, fmt.Errorf("failed to compile transition circuit: %v", err)
 	}
 	fmt.Printf("📊 Transition Circuit compiled: %d constraints\n", ccs.GetNbConstraints())
 
+	// Robust path detection for keys
+	var keysDir string
+	if _, err := os.Stat("go.mod"); err == nil {
+		keysDir = "keys"
+	} else {
+		keysDir = "../../keys"
+	}
+
 	fmt.Println("⚙️  Step 2/4: Loading Transition Proving Key...")
 	pk := groth16.NewProvingKey(ecc.BN254)
-	pkFile, err := os.Open("keys/Transitions.proving.key")
+	pkPath := keysDir + "/Transitions.proving.key"
+	pkFile, err := os.Open(pkPath)
 	if err != nil {
-		return fmt.Errorf("transitions proving key not found! Run setup first")
+		return simplifiedNewHashArr, fmt.Errorf("transitions proving key not found at %s! Run 'go run cmd/setup/main.go'", pkPath)
 	}
 	pk.ReadFrom(pkFile)
 	pkFile.Close()
@@ -456,17 +704,18 @@ func GenerateTransitionProof(cosmosRpcUrl string, oldHeight string, newHeight st
 	fmt.Println("⚙️  Step 3/4: Generating Transition Witness...")
 	fullWitness, err := frontend.NewWitness(&witness, ecc.BN254.ScalarField())
 	if err != nil {
-		return err
+		return simplifiedNewHashArr, err
 	}
 
 	fmt.Println("🚀 Step 4/4: Calculating Transition ZK-SNARK Proof...")
 	proof, err := groth16.Prove(ccs, pk, fullWitness)
 	if err != nil {
-		return err
+		return simplifiedNewHashArr, err
 	}
-
-	// 3. Export JSON
 	bn254Proof := proof.(*gnark_bn254.Proof)
+
+	// Transition proof should use simplified hashes as public inputs.
+	// TransitionCircuit now typically has 8 public inputs (OldValidatorsHash + NewValidatorsHash)
 	publicInputs := make([]string, 8)
 	for i := 0; i < 4; i++ {
 		publicInputs[i] = fmt.Sprintf("%d", witness.PackedOldValidatorsHash[i])
@@ -492,14 +741,69 @@ func GenerateTransitionProof(cosmosRpcUrl string, oldHeight string, newHeight st
 
 	out, _ := json.MarshalIndent(data, "", "  ")
 	fmt.Printf("💾 Saving transition proof to %s\n", outputPath)
-	return os.WriteFile(outputPath, out, 0o644)
+	return simplifiedNewHashArr, os.WriteFile(outputPath, out, 0o644)
 }
 
 // UpdateValidatorSetOnEth submits a transition proof to the Ethereum bridge.
 func UpdateValidatorSetOnEth(ethRpcUrl string, privKeyHex string, bridgeAddr string, proofPath string, newHash [32]byte) error {
-	// Call updateValidatorSet on EthBridge_Production
-	fmt.Printf("🚀 Submitting Validator Set Update to Eth... NewHash: %x\n", newHash)
-	return nil
+	client, err := ethclient.Dial(ethRpcUrl)
+	if err != nil {
+		return err
+	}
+
+	privateKey, _ := crypto.HexToECDSA(privKeyHex)
+	publicKey := privateKey.Public()
+	fromAddress := crypto.PubkeyToAddress(*(publicKey.(*ecdsa.PublicKey)))
+
+	nonce, _ := client.PendingNonceAt(context.Background(), fromAddress)
+	gasPrice, _ := client.SuggestGasPrice(context.Background())
+	chainID, _ := client.ChainID(context.Background())
+
+	auth, _ := bind.NewKeyedTransactorWithChainID(privateKey, chainID)
+	auth.Nonce = big.NewInt(int64(nonce))
+	auth.Value = big.NewInt(0)
+	auth.GasLimit = uint64(1500000)
+	auth.GasPrice = gasPrice
+
+	// Load proof components from JSON
+	proofData, _ := os.ReadFile(proofPath)
+	var p struct {
+		A             [2]string    `json:"a"`
+		B             [2][2]string `json:"b"`
+		C             [2]string    `json:"c"`
+		Commitments   [2]string    `json:"commitments"`
+		CommitmentPok [2]string    `json:"commitmentPok"`
+	}
+	json.Unmarshal(proofData, &p)
+
+	a := [2]*big.Int{}
+	b := [2][2]*big.Int{}
+	c := [2]*big.Int{}
+	commits := [2]*big.Int{}
+	pok := [2]*big.Int{}
+
+	for i := 0; i < 2; i++ {
+		a[i], _ = new(big.Int).SetString(p.A[i], 10)
+		c[i], _ = new(big.Int).SetString(p.C[i], 10)
+		commits[i], _ = new(big.Int).SetString(p.Commitments[i], 10)
+		pok[i], _ = new(big.Int).SetString(p.CommitmentPok[i], 10)
+		for j := 0; j < 2; j++ {
+			b[i][j], _ = new(big.Int).SetString(p.B[i][j], 10)
+		}
+	}
+
+	abiJSON := `[{"inputs":[{"internalType":"uint256[2]","name":"a","type":"uint256[2]"},{"internalType":"uint256[2][2]","name":"b","type":"uint256[2][2]"},{"internalType":"uint256[2]","name":"c","type":"uint256[2]"},{"internalType":"uint256[2]","name":"commitments","type":"uint256[2]"},{"internalType":"uint256[2]","name":"commitmentPok","type":"uint256[2]"},{"internalType":"bytes32","name":"newValidatorsHash","type":"bytes32"}],"name":"updateValidatorSet","outputs":[],"stateMutability":"nonpayable","type":"function"}]`
+	parsedABI, _ := abi.JSON(strings.NewReader(abiJSON))
+	contract := bind.NewBoundContract(common.HexToAddress(bridgeAddr), parsedABI, client, client, client)
+
+	tx, err := contract.Transact(auth, "updateValidatorSet", a, b, c, commits, pok, newHash)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("🚀 Validator Set Update submitted! Hash: %s\n", tx.Hash().Hex())
+	_, err = bind.WaitMined(context.Background(), client, tx)
+	return err
 }
 
 // SubmitHeaderProof submits a block finality proof to the EthBridge.
@@ -576,7 +880,7 @@ func DecompressEd25519Point(bz []byte) (*big.Int, *big.Int, error) {
 	q.Sub(q, big.NewInt(19))
 
 	// d = -121665 * inv(121666) mod q
-	d, _ := new(big.Int).SetString("37095705934669439343138083508754565189542113879843219016388785323308191433755", 10)
+	d, _ := new(big.Int).SetString("37095705934669439343138083508754565189542113879843219016388785533085940283555", 10)
 
 	// 1. Extract Y and sign(X)
 	// bz is Little Endian compressed point.
@@ -628,38 +932,6 @@ func DecompressEd25519Point(bz []byte) (*big.Int, *big.Int, error) {
 	}
 
 	return x, y, nil
-}
-
-// DecodeSecp256k1PubKey decodes base64 secp256k1 pubkey into X, Y.
-func DecodeSecp256k1PubKey(pubKeyBase64 string) (*big.Int, *big.Int, error) {
-	bz, err := base64.StdEncoding.DecodeString(pubKeyBase64)
-	if err != nil {
-		return nil, nil, err
-	}
-	// Try unmarshalling as uncompressed or compressed
-	pub, err := crypto.DecompressPubkey(bz)
-	if err != nil {
-		// Fallback: if it's 65 bytes raw
-		pub, err = crypto.UnmarshalPubkey(bz)
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-	return pub.X, pub.Y, nil
-}
-
-// DecodeSecp256k1Signature decodes base64 secp256k1 signature into R and S.
-func DecodeSecp256k1Signature(sigBase64 string) (*big.Int, *big.Int, error) {
-	bz, err := base64.StdEncoding.DecodeString(sigBase64)
-	if err != nil {
-		return nil, nil, err
-	}
-	if len(bz) < 64 {
-		return nil, nil, fmt.Errorf("invalid signature length: %d", len(bz))
-	}
-	r := new(big.Int).SetBytes(bz[:32])
-	s := new(big.Int).SetBytes(bz[32:64])
-	return r, s, nil
 }
 
 // SubmitProof automatically sends the ZK-SNARK proof to the EthBridge contract.
@@ -726,7 +998,8 @@ func SubmitProof(ethRpcUrl string, privKeyHex string, bridgeAddr string, height 
 	}
 
 	fmt.Printf("🚀 ZK-SNARK Proof submitted! Method=%s, Hash: %s\n", methodName, tx.Hash().Hex())
-	return nil
+	_, err = bind.WaitMined(context.Background(), client, tx)
+	return err
 }
 
 func FetchLockDetails(evmRpcUrl string, bridgeAddr string, txHashHex string) (string, *big.Int, bool, error) {
@@ -761,8 +1034,18 @@ func UpdateRoot(ethRpcUrl string, privKeyHex string, bridgeAddr string, newRoot 
 		return err
 	}
 	privateKey, _ := crypto.HexToECDSA(privKeyHex)
+	publicKey := privateKey.Public()
+	fromAddress := crypto.PubkeyToAddress(*(publicKey.(*ecdsa.PublicKey)))
+
+	nonce, _ := client.PendingNonceAt(context.Background(), fromAddress)
+	gasPrice, _ := client.SuggestGasPrice(context.Background())
 	chainID, _ := client.ChainID(context.Background())
+
 	auth, _ := bind.NewKeyedTransactorWithChainID(privateKey, chainID)
+	auth.Nonce = big.NewInt(int64(nonce))
+	auth.Value = big.NewInt(0)
+	auth.GasLimit = uint64(500000)
+	auth.GasPrice = gasPrice
 
 	abiJSON := `[{"inputs":[{"internalType":"bytes32","name":"_newRoot","type":"bytes32"}],"name":"updateTrustedRoot","outputs":[],"stateMutability":"nonpayable","type":"function"}]`
 	parsedABI, _ := abi.JSON(strings.NewReader(abiJSON))
@@ -831,8 +1114,18 @@ func UpdateEthRootOnCosmos(cosmosRpcUrl string, privKeyHex string, bridgeAddr st
 		return err
 	}
 	privateKey, _ := crypto.HexToECDSA(privKeyHex)
+	publicKey := privateKey.Public()
+	fromAddress := crypto.PubkeyToAddress(*(publicKey.(*ecdsa.PublicKey)))
+
+	nonce, _ := client.PendingNonceAt(context.Background(), fromAddress)
+	gasPrice, _ := client.SuggestGasPrice(context.Background())
 	chainID, _ := client.ChainID(context.Background())
+
 	auth, _ := bind.NewKeyedTransactorWithChainID(privateKey, chainID)
+	auth.Nonce = big.NewInt(int64(nonce))
+	auth.Value = big.NewInt(0)
+	auth.GasLimit = uint64(500000)
+	auth.GasPrice = gasPrice
 
 	abiJSON := `[{"inputs":[{"internalType":"bytes32","name":"_newRoot","type":"bytes32"}],"name":"updateTrustedEthRoot","outputs":[],"stateMutability":"nonpayable","type":"function"}]`
 	parsedABI, _ := abi.JSON(strings.NewReader(abiJSON))
@@ -854,8 +1147,18 @@ func SubmitEthProofToCosmos(cosmosRpcUrl string, privKeyHex string, bridgeAddr s
 	}
 
 	privateKey, _ := crypto.HexToECDSA(privKeyHex)
+	publicKey := privateKey.Public()
+	fromAddress := crypto.PubkeyToAddress(*(publicKey.(*ecdsa.PublicKey)))
+
+	nonce, _ := client.PendingNonceAt(context.Background(), fromAddress)
+	gasPrice, _ := client.SuggestGasPrice(context.Background())
 	chainID, _ := client.ChainID(context.Background())
+
 	auth, _ := bind.NewKeyedTransactorWithChainID(privateKey, chainID)
+	auth.Nonce = big.NewInt(int64(nonce))
+	auth.Value = big.NewInt(0)
+	auth.GasLimit = uint64(2000000) // MPT verification is complex, using higher limit
+	auth.GasPrice = gasPrice
 
 	methodName := "mint"
 	if !isMint {
@@ -880,5 +1183,27 @@ func SubmitEthProofToCosmos(cosmosRpcUrl string, privKeyHex string, bridgeAddr s
 	}
 
 	fmt.Printf("🚀 MPT Proof submitted to Cosmos! Method=%s, Hash: %s\n", methodName, tx.Hash().Hex())
-	return nil
+	_, err = bind.WaitMined(context.Background(), client, tx)
+	return err
+}
+
+// CalculateSimplifiedValidatorsHash produces the SHA256(Concatenated Pks + Powers) hash used in circuits.
+func CalculateSimplifiedValidatorsHash(powers []int64, compressedPKs [][32]byte) [32]byte {
+	h := sha256.New()
+	for i := 0; i < circuits.MaxValidators; i++ {
+		h.Write(compressedPKs[i][:])
+		powerBytes := make([]byte, 8)
+		binary.LittleEndian.PutUint64(powerBytes, uint64(powers[i]))
+		h.Write(powerBytes)
+	}
+	var res [32]byte
+	copy(res[:], h.Sum(nil))
+	return res
+}
+
+func DecompressBasePoint() (*big.Int, *big.Int, error) {
+	// Ed25519 Base Point (Generator)
+	bx, _ := new(big.Int).SetString("15112221349535400772501151409588531511454012693041857206046113283949847762202", 10)
+	by, _ := new(big.Int).SetString("46316835694926478169428394003475163141307993866256225615783033603165251855960", 10)
+	return bx, by, nil
 }

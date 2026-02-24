@@ -9,17 +9,20 @@ import (
 	"github.com/consensys/gnark/frontend/cs/r1cs"
 	"github.com/consensys/gnark/std/math/emulated"
 	"github.com/consensys/gnark/test"
+	"github.com/vitwit/zk-cosmos-eth-bridge/bridge/pkg/circuits/ed25519"
 )
 
 func TestValidatorCircuit(t *testing.T) {
 	assert := test.NewAssert(t)
 
 	var circuit ValidatorCircuit
+	circuit.AllocateSlices()
 
 	// Create witness
 	var witness ValidatorCircuit
 	witness.TotalPower = 70
 	witness.Height = 100
+	witness.AllocateSlices()
 
 	for i := 0; i < 4; i++ {
 		witness.PackedValidatorsHash[i] = 0
@@ -30,10 +33,11 @@ func TestValidatorCircuit(t *testing.T) {
 	for i := 0; i < MaxValidators; i++ {
 		witness.VotingPowers[i] = 0
 		witness.Signed[i] = 0
-		witness.PublicKeys[i].X = emulated.ValueOf[emulated.Secp256k1Fp](0)
-		witness.PublicKeys[i].Y = emulated.ValueOf[emulated.Secp256k1Fp](0)
-		witness.Signatures[i].R = emulated.ValueOf[emulated.Secp256k1Fr](1)
-		witness.Signatures[i].S = emulated.ValueOf[emulated.Secp256k1Fr](1)
+		witness.PublicKeys[i].A.X = emulated.ValueOf[ed25519.Ed25519Fp](0)
+		witness.PublicKeys[i].A.Y = emulated.ValueOf[ed25519.Ed25519Fp](1)
+		witness.Signatures[i].R.X = emulated.ValueOf[ed25519.Ed25519Fp](0)
+		witness.Signatures[i].R.Y = emulated.ValueOf[ed25519.Ed25519Fp](1)
+		witness.Signatures[i].S = emulated.ValueOf[ed25519.Ed25519Fr](0)
 	}
 
 	witness.VotingPowers[0] = 70 // > 2/3 of 70
@@ -44,7 +48,7 @@ func TestValidatorCircuit(t *testing.T) {
 	// To pass Verify, pk must be valid point, R, S must be valid etc.
 	// But here we're testing COMPILATION primarily.
 
-	fmt.Println("⚙️  Compiling Production Validator Circuit (ECDSA)...")
+	fmt.Println("⚙️  Compiling Production Validator Circuit (Ed25519)...")
 	ccs, err := frontend.Compile(ecc.BN254.ScalarField(), r1cs.NewBuilder, &circuit)
 	if err != nil {
 		t.Fatal(err)

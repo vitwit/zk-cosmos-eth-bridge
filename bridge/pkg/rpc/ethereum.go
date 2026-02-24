@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/ethereum/go-ethereum/core/rawdb"
@@ -149,6 +150,56 @@ func (c *EthClient) GetTrustedRoot(bridgeAddr string, height uint64) ([32]byte, 
 
 	copy(root[:], bz)
 	return root, nil
+}
+
+// GetCurrentValidatorsHash fetches the anchored validator set hash on Ethereum.
+func (c *EthClient) GetCurrentValidatorsHash(bridgeAddr string) (string, error) {
+	// Function selector for currentValidatorsHash() is 0x39130095
+	result, err := c.Call("eth_call", map[string]interface{}{
+		"to":   bridgeAddr,
+		"data": "0x39130095",
+	}, "latest")
+	if err != nil {
+		return "", err
+	}
+
+	var hexResult string
+	if err := json.Unmarshal(result, &hexResult); err != nil {
+		return "", err
+	}
+	return hexResult, nil
+}
+
+// GetLastProcessedHeight fetches the last anchored Cosmos height on Ethereum.
+func (c *EthClient) GetLastProcessedHeight(bridgeAddr string) (uint64, error) {
+	// Function selector for lastProcessedHeight() is 0x296ce3f8
+	result, err := c.Call("eth_call", map[string]interface{}{
+		"to":   bridgeAddr,
+		"data": "0x296ce3f8",
+	}, "latest")
+	if err != nil {
+		return 0, err
+	}
+
+	var hexResult string
+	if err := json.Unmarshal(result, &hexResult); err != nil {
+		return 0, err
+	}
+
+	trimmed := strings.TrimPrefix(hexResult, "0x")
+	if trimmed == "" {
+		return 0, nil
+	}
+	val, err := strconv.ParseUint(trimmed, 16, 64)
+	if err != nil {
+		// Handle 32-byte padded return
+		if len(trimmed) > 16 {
+			trimmed = trimmed[len(trimmed)-16:]
+			return strconv.ParseUint(trimmed, 16, 64)
+		}
+		return 0, err
+	}
+	return val, nil
 }
 
 type ReceiptProof struct {

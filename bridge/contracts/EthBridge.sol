@@ -103,7 +103,7 @@ contract EthBridge is ERC20 {
         // [13]:     TotalPower
 
         uint256[8] memory proof = packProof(a, b, c);
-        uint256[] memory inputs = new uint256[](14);
+        uint256[14] memory inputs;
         uint256[8] memory hashes1 = packTwoHashes(currentValidatorsHash, blockHash);
         uint256[8] memory hashes2 = packTwoHashes(dataHash, bytes32(0)); // Only need first 4 for DH
 

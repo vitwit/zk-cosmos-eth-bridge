@@ -4,7 +4,7 @@ A high-performance Zero-Knowledge proof-based bridge facilitating trustless, bid
 
 ## 🌟 Key Features
 
-- **Triple-Verifier Architecture**: Modular ZK logic for block finality (Secp256k1/Quorum), validator transitions, and transaction inclusion.
+- **Triple-Verifier Architecture**: Modular ZK logic for block finality (Ed25519/Quorum), validator transitions, and transaction inclusion.
 - **Sequential Finality**: On-chain block height tracking prevents replays and ensures cryptographic consistency.
 - **Bidirectional Transfers**: Trustless transfers between Ethereum (MPT-based) and Cosmos (ZK-SNARK based).
 - **Real-Time Orchestration**: Automated Go-based relayer handles header synchronization and event detection using WebSockets.
