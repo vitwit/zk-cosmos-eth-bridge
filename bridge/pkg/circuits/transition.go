@@ -5,7 +5,6 @@ import (
 	"math/big"
 
 	"github.com/consensys/gnark/frontend"
-	"github.com/consensys/gnark/std/hash/sha2"
 	"github.com/consensys/gnark/std/math/cmp"
 	"github.com/consensys/gnark/std/math/uints"
 	"github.com/vitwit/zk-cosmos-eth-bridge/bridge/pkg/circuits/ed25519"
@@ -17,15 +16,28 @@ type TransitionCircuit struct {
 	PackedOldValidatorsHash [4]frontend.Variable `gnark:",public"`
 	PackedNewValidatorsHash [4]frontend.Variable `gnark:",public"`
 
-	// Private Inputs (The Old Validator Set)
-	VotingPowers []frontend.Variable
-	PublicKeys   []ed25519.PublicKey
-	TotalPower   frontend.Variable
+	// Canonical Header Fields for the New Set (Leaves for the 14-field Merkle Tree)
+	NewHeaderLeaves [14][32]uints.U8
 
-	// Private Inputs (Anchor metadata for New Set)
-	PackedNewBlockHash [4]frontend.Variable
-	PackedNewDataHash  [4]frontend.Variable
-	NewHeight          frontend.Variable
+	// Signing Metadata (matching the old set's commit to the new set)
+	ChainID   []uints.U8
+	BlockID   [32]uints.U8 // The New BlockID being signed
+	Height    frontend.Variable
+	Timestamp [12]uints.U8
+	Round     frontend.Variable
+
+	// SignBytes (Private Inputs for each validator's vote from the OLD set)
+	SignBytes [][]uints.U8
+
+	// Private Inputs (The Old Validator Set)
+	VotingPowers       []frontend.Variable
+	ProposerPriorities []frontend.Variable
+	PublicKeys         []ed25519.PublicKey
+	TotalPower         frontend.Variable
+
+	// Byte representations for bit-perfect ValidatorsHash reconstruction (of the OLD set)
+	VotingPowerBytes      [][]uints.U8
+	ProposerPriorityBytes [][]uints.U8
 
 	// Private Inputs (The Signatures from the Old Set)
 	Signatures []ed25519.Signature
@@ -39,52 +51,82 @@ func (c *TransitionCircuit) Define(api frontend.API) error {
 		return err
 	}
 
-	// Unpack OldValidatorsHash
+	// 1. Unpack OldValidatorsHash
 	oldVhBytes := c.unpack(api, c.PackedOldValidatorsHash)
-	u8Api, _ := uints.NewBytes(api)
+	comet := NewCometBFTGadget(api)
 
-	// Verify Old Set Hash
-	sha, _ := sha2.New(api)
+	// Verify Old Set Hash (Bit-Perfect)
+	valHashes := make([][]uints.U8, MaxValidators)
+	var prevAddr []uints.U8
+
 	for i := 0; i < MaxValidators; i++ {
-		// Serialize PK (32-byte compressed format)
+		// Serialize PK (Protobuf encoded)
 		pkBytes := eddsa.SerializePoint(c.PublicKeys[i].A)
-		sha.Write(pkBytes[:])
+		protoPK := make([]uints.U8, 34)
+		protoPK[0] = uints.U8{Val: 0x0a}
+		protoPK[1] = uints.U8{Val: 0x20}
+		for j := 0; j < 32; j++ {
+			protoPK[2+j] = pkBytes[j]
+		}
 
-		powerBits := api.ToBinary(c.VotingPowers[i], 64)
-		sha.Write(bitsToU8(api, u8Api, powerBits))
+		// Address & Sorting
+		addr := comet.ComputeAddress(pkBytes[:])
+		if i > 0 {
+			api.AssertIsEqual(comet.IsLess(prevAddr, addr), 1)
+		}
+		prevAddr = addr
+
+		// 1. Decode Varint-encoded power and priority
+		decodedPower, _ := comet.DecodeVarint(c.VotingPowerBytes[i])
+		api.AssertIsEqual(decodedPower, c.VotingPowers[i])
+
+		decodedPriority, _ := comet.DecodeVarint(c.ProposerPriorityBytes[i])
+		api.AssertIsEqual(decodedPriority, c.ProposerPriorities[i])
+
+		valHashes[i] = comet.HashValidator(addr, protoPK, c.VotingPowerBytes[i], c.ProposerPriorityBytes[i])
 	}
 
-	actualOldHash := sha.Sum()
+	actualOldHash := comet.ValidatorsHash(valHashes)
 	for i := 0; i < 32; i++ {
 		api.AssertIsEqual(actualOldHash[i].Val, oldVhBytes[i].Val)
 	}
 
-	// 2. Verify that OldSet signed NewBlockHash
-	newBhBytes := c.unpack(api, c.PackedNewBlockHash)
+	// 2. Canonical Header Hash Verification for the NEW block
+	var newLeaves [][]uints.U8
+	for i := 0; i < 14; i++ {
+		newLeaves = append(newLeaves, c.NewHeaderLeaves[i][:])
+	}
+	computedNewBH := comet.RFC6962TreeHash(newLeaves)
 
-	// 2a. Link NewBlockHash to NewValidatorsHash (Simplified Anchor)
-	// This ensures the message signed by OldSet actually commits to the NewSet.
+	// Ensure NewBlockHash commits to NewValidatorsHash (Public Input)
 	newVhBytes := c.unpack(api, c.PackedNewValidatorsHash)
-	newDhBytes := c.unpack(api, c.PackedNewDataHash)
-	headerSha, _ := sha2.New(api)
-	headerSha.Write(newVhBytes)
-	headerSha.Write(newDhBytes)
-	heightBits := api.ToBinary(c.NewHeight, 64)
-	headerSha.Write(bitsToU8(api, u8Api, heightBits))
-	computedNewBH := headerSha.Sum()
 	for i := 0; i < 32; i++ {
-		api.AssertIsEqual(computedNewBH[i].Val, newBhBytes[i].Val)
+		api.AssertIsEqual(newLeaves[7][i].Val, newVhBytes[i].Val)
 	}
 
 	var signedPower frontend.Variable = 0
 	var totalPowerCalculated frontend.Variable = 0
 
+	var lastAddress []uints.U8
 	for i := 0; i < MaxValidators; i++ {
-		// Verify signature against NewBlockHash (conditionally)
-		err = eddsa.Verify(c.Signatures[i], newBhBytes, c.PublicKeys[i], c.Signed[i])
+		// 3. Verify that the SignBytes are canonical
+		// The SignBytes (precommit from old set) must commit to the NEW block hash.
+		comet.VerifyCanonicalVote(c.Signed[i], c.SignBytes[i], c.Height, c.Round, computedNewBH)
+
+		// 3a. Verify Ed25519 Signature over the canonical SignBytes
+		err = eddsa.Verify(c.Signatures[i], c.SignBytes[i], c.PublicKeys[i], c.Signed[i])
 		if err != nil {
 			return err
 		}
+
+		// 4. Validator Address and Sorting (of the old set)
+		pkBytes := eddsa.SerializePoint(c.PublicKeys[i].A)
+		addr := comet.ComputeAddress(pkBytes[:])
+
+		if i > 0 {
+			api.AssertIsEqual(comet.IsLess(lastAddress, addr), 1)
+		}
+		lastAddress = addr
 
 		api.AssertIsBoolean(c.Signed[i])
 		totalPowerCalculated = api.Add(totalPowerCalculated, c.VotingPowers[i])
@@ -122,8 +164,63 @@ func (c *TransitionCircuit) AllocateSlices() {
 		fmt.Printf("⚠️  WARNING: MaxValidators is %d, defaulting to 1 for safety\n", MaxValidators)
 		MaxValidators = 1
 	}
+
+	// 1. Initialize Public Inputs and Scalar Variables
+	for i := 0; i < 4; i++ {
+		c.PackedOldValidatorsHash[i] = 0
+		c.PackedNewValidatorsHash[i] = 0
+	}
+	c.Height = 0
+	c.TotalPower = 0
+	c.Round = 0
+
+	// 2. Initialize Byte Arrays and Slices
 	c.VotingPowers = make([]frontend.Variable, MaxValidators)
+	c.ProposerPriorities = make([]frontend.Variable, MaxValidators)
+	c.Signed = make([]frontend.Variable, MaxValidators)
+	for i := 0; i < MaxValidators; i++ {
+		c.VotingPowers[i] = 0
+		c.ProposerPriorities[i] = 0
+		c.Signed[i] = 0
+	}
+
+	// NEW Header Merkle Tree Leaves
+	for i := 0; i < 14; i++ {
+		for j := 0; j < 32; j++ {
+			c.NewHeaderLeaves[i][j] = uints.U8{Val: 0}
+		}
+	}
+
+	// Metadata
+	for i := 0; i < 32; i++ {
+		c.BlockID[i] = uints.U8{Val: 0}
+	}
+	for i := 0; i < 12; i++ {
+		c.Timestamp[i] = uints.U8{Val: 0}
+	}
+	c.ChainID = make([]uints.U8, 32)
+	for i := 0; i < 32; i++ {
+		c.ChainID[i] = uints.U8{Val: 0}
+	}
+
+	// Signing Data
+	c.SignBytes = make([][]uints.U8, MaxValidators)
+	c.VotingPowerBytes = make([][]uints.U8, MaxValidators)
+	c.ProposerPriorityBytes = make([][]uints.U8, MaxValidators)
+	for i := 0; i < MaxValidators; i++ {
+		c.SignBytes[i] = make([]uints.U8, 112)
+		c.VotingPowerBytes[i] = make([]uints.U8, 10)
+		c.ProposerPriorityBytes[i] = make([]uints.U8, 10)
+		for j := 0; j < 112; j++ {
+			c.SignBytes[i][j] = uints.U8{Val: 0}
+		}
+		for j := 0; j < 10; j++ {
+			c.VotingPowerBytes[i][j] = uints.U8{Val: 0}
+			c.ProposerPriorityBytes[i][j] = uints.U8{Val: 0}
+		}
+	}
+
+	// Ed25519 Fields
 	c.PublicKeys = make([]ed25519.PublicKey, MaxValidators)
 	c.Signatures = make([]ed25519.Signature, MaxValidators)
-	c.Signed = make([]frontend.Variable, MaxValidators)
 }

@@ -23,6 +23,7 @@ import (
 	"github.com/consensys/gnark/frontend"
 	"github.com/consensys/gnark/frontend/cs/r1cs"
 	"github.com/consensys/gnark/std/math/emulated"
+	"github.com/consensys/gnark/std/math/uints"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
@@ -233,45 +234,56 @@ func GenerateValidatorProof(cosmosRpcUrl string, height string, outputPath strin
 	proverMutex.Lock()
 	defer proverMutex.Unlock()
 
-	var simplifiedHash [32]byte
-	var simulatedBHArr [32]byte
+	var blockHash [32]byte
+	var actualVH []byte
 	client := rpc.NewCosmosClient(cosmosRpcUrl)
 
 	fmt.Printf("📡 Fetching Validator Set at height %s...\n", height)
 	valResp, err := client.GetValidators(height)
 	if err != nil {
-		return simplifiedHash, simulatedBHArr, nil, err
+		return blockHash, blockHash, nil, err
 	}
 
 	fmt.Printf("📡 Fetching Commit at height %s...\n", height)
 	commitResp, err := client.GetCommit(height)
 	if err != nil {
-		return simplifiedHash, simulatedBHArr, nil, err
+		return blockHash, blockHash, nil, err
 	}
 
 	// Validate that we have signatures in the commit
 	if len(commitResp.Result.SignedHeader.Commit.Signatures) == 0 {
-		return simplifiedHash, simulatedBHArr, nil, fmt.Errorf("no signatures found in commit at height %s - the block may not be finalized yet", height)
+		return blockHash, blockHash, nil, fmt.Errorf("no signatures found in commit at height %s - the block may not be finalized yet", height)
 	}
+	// 1. Prepare Witness
 
 	// 1. Prepare Witness
 	var witness circuits.ValidatorCircuit
 	witness.AllocateSlices()
 
-	// Init arrays with defaults to avoid nil/empty issues in gnark
-	// Use Base Point (Generator) for non-signing slots to avoid small group issues
-	bx, by, _ := DecompressEd25519Point(native_ed25519.PublicKey{0x01}) // This returns neutral point if bytes is 1? No.
-	// Actually Ed25519 base point is better.
-	bx, by, _ = DecompressBasePoint()
+	// Initialise with Base Point for safety against nil-pointer errors in emulated fields
+	bx, by, err := DecompressBasePoint()
+	if err != nil {
+		return blockHash, blockHash, nil, fmt.Errorf("failed to decompress base point: %v", err)
+	}
 
 	for i := 0; i < circuits.MaxValidators; i++ {
 		witness.VotingPowers[i] = big.NewInt(0)
+		witness.ProposerPriorities[i] = big.NewInt(0)
 		witness.Signed[i] = 0
 		witness.PublicKeys[i].A.X = emulated.ValueOf[ed25519.Ed25519Fp](bx)
 		witness.PublicKeys[i].A.Y = emulated.ValueOf[ed25519.Ed25519Fp](by)
 		witness.Signatures[i].R.X = emulated.ValueOf[ed25519.Ed25519Fp](bx)
 		witness.Signatures[i].R.Y = emulated.ValueOf[ed25519.Ed25519Fp](by)
 		witness.Signatures[i].S = emulated.ValueOf[ed25519.Ed25519Fr](0)
+
+		// Zero-pad byte arrays for bit-perfect hashing
+		for j := 0; j < 10; j++ {
+			witness.VotingPowerBytes[i][j] = uints.U8{Val: 0}
+			witness.ProposerPriorityBytes[i][j] = uints.U8{Val: 0}
+		}
+		for j := 0; j < 112; j++ {
+			witness.SignBytes[i][j] = uints.U8{Val: 0}
+		}
 	}
 
 	// Map of Address -> CommitSig
@@ -280,14 +292,28 @@ func GenerateValidatorProof(cosmosRpcUrl string, height string, outputPath strin
 		sigs[sig.ValidatorAddress] = sig
 	}
 
-	// 1. Unpack Metadata
-	dHash, _ := rpc.DecodeHash(commitResp.Result.SignedHeader.Header.DataHash)
+	// 1. Unpack Header and Metadata
+	headerLeaves := HashHeaderLeaves(*commitResp)
+	for i := 0; i < 14; i++ {
+		for j := 0; j < 32; j++ {
+			witness.HeaderLeaves[i][j] = uints.U8{Val: headerLeaves[i][j]}
+		}
+	}
+
 	hInt := new(big.Int)
 	hInt.SetString(height, 10)
 	witness.Height = hInt
+	witness.Round = big.NewInt(int64(commitResp.Result.SignedHeader.Commit.Round))
 
+	dHash, _ := rpc.DecodeHash(commitResp.Result.SignedHeader.Header.DataHash)
 	for i := 0; i < 4; i++ {
 		witness.PackedDataHash[i] = binary.BigEndian.Uint64(dHash[i*8 : (i+1)*8])
+	}
+
+	// ChainID (e.g. "cosmos-test-1")
+	chainID := commitResp.Result.SignedHeader.Header.ChainID
+	for i := 0; i < 32 && i < len(chainID); i++ {
+		witness.ChainID[i] = uints.U8{Val: chainID[i]}
 	}
 
 	// 2. Prepare Validators List and Map Signatures
@@ -297,7 +323,6 @@ func GenerateValidatorProof(cosmosRpcUrl string, height string, outputPath strin
 		pks[i][0] = 0x01
 	}
 
-	// 2. Prepare Validators List and Map Signatures
 	// This loop now populates the witness with public keys and voting powers,
 	// and marks validators as signed or not.
 	for i := 0; i < circuits.MaxValidators && i < len(valResp.Result.Validators); i++ {
@@ -311,56 +336,63 @@ func GenerateValidatorProof(cosmosRpcUrl string, height string, outputPath strin
 		seed := sha256.Sum256(pkBytes)
 		privKey := native_ed25519.NewKeyFromSeed(seed[:])
 		derivedPubKey := privKey.Public().(native_ed25519.PublicKey)
-
-		px, py, _ := DecompressEd25519Point(derivedPubKey)
+		px, py, err := DecompressEd25519Point(derivedPubKey)
+		if err != nil {
+			return blockHash, blockHash, nil, fmt.Errorf("failed to decompress public key for validator %d: %v", i, err)
+		}
 		witness.PublicKeys[i].A.X = emulated.ValueOf[ed25519.Ed25519Fp](px)
 		witness.PublicKeys[i].A.Y = emulated.ValueOf[ed25519.Ed25519Fp](py)
 		copy(pks[i][:], derivedPubKey)
 
 		_, signed := sigs[v.Address]
+		witness.Signed[i] = 0
 		if signed {
 			witness.Signed[i] = 1
-		} else {
-			witness.Signed[i] = 0
 		}
+
 		powers[i] = power.Int64()
-	}
 
-	// 3. Total Power and Simplified Hash
-	// Use actual ValidatorsHash from the header if available, otherwise fallback to calculation
-	actualValidatorsHash, err := rpc.DecodeHash(commitResp.Result.SignedHeader.Header.ValidatorsHash)
-	if err == nil {
-		copy(simplifiedHash[:], actualValidatorsHash)
-	} else {
-		simplifiedHash = CalculateSimplifiedValidatorsHash(powers, pks)
-	}
-
-	var totalSigningPower int64 = 0
-	for i := 0; i < circuits.MaxValidators && i < len(valResp.Result.Validators); i++ {
-		if witness.Signed[i].(int) == 1 {
-			v := valResp.Result.Validators[i]
-			p, _ := strconv.ParseInt(v.VotingPower, 10, 64)
-			totalSigningPower += p
+		// Bit-perfect Varint encoding
+		pBytes := ProtoEncodeInt64(powers[i])
+		for j := 0; j < len(pBytes) && j < 10; j++ {
+			witness.VotingPowerBytes[i][j] = uints.U8{Val: pBytes[j]}
 		}
+
+		// Proposer Priority
+		priority, _ := strconv.ParseInt(v.ProposerPriority, 10, 64)
+		witness.ProposerPriorities[i] = big.NewInt(priority)
+
+		prBytes := ProtoEncodeInt64(priority)
+		for j := 0; j < len(prBytes) && j < 10; j++ {
+			witness.ProposerPriorityBytes[i][j] = uints.U8{Val: prBytes[j]}
+		}
+
+		// Ensure signatures for non-signed but existing validators are initialized to a valid point
+		// (Already done in the main initialization loop above)
 	}
 
-	witness.TotalPower = big.NewInt(totalSigningPower)
-	fmt.Printf("🔍 Using ValidatorsHash: %x, Total Signing Power: %d\n", simplifiedHash, totalSigningPower)
+	// 3. Total Power
+	var totalPowerAll int64 = 0
+	for _, v := range valResp.Result.Validators {
+		p, _ := strconv.ParseInt(v.VotingPower, 10, 64)
+		totalPowerAll += p
+	}
+	witness.TotalPower = big.NewInt(totalPowerAll)
 
-	// 4. Calculate SIMULATED block hash (Signed Message)
-	h := sha256.New()
-	h.Write(simplifiedHash[:])
-	h.Write(dHash)
-	heightBytes := make([]byte, 8)
-	binary.LittleEndian.PutUint64(heightBytes, uint64(hInt.Int64()))
-	h.Write(heightBytes)
-	simulatedBH := h.Sum(nil)
-	copy(simulatedBHArr[:], simulatedBH)
-	fmt.Printf("🔍 Calculated SimulatedBlockHash: %x\n", simulatedBH)
+	// Block Hash from CometBFT (Canonical Header Root)
+	actualRoot, _ := rpc.DecodeHash(commitResp.Result.SignedHeader.Commit.BlockID.Hash)
+	copy(blockHash[:], actualRoot)
 
+	fmt.Printf("🔍 Canonical Block Hash: %x, Total Set Power: %d\n", blockHash, totalPowerAll)
+	for i := 0; i < circuits.MaxValidators && i < len(valResp.Result.Validators); i++ {
+		fmt.Printf("  ├─ Validator[%d]: Power=%d, Signed=%v\n", i, powers[i], witness.Signed[i])
+	}
+
+	// 4. Set Public Inputs for BlockHash and ValidatorsHash
+	actualVH, _ = rpc.DecodeHash(commitResp.Result.SignedHeader.Header.ValidatorsHash)
 	for i := 0; i < 4; i++ {
-		witness.PackedValidatorsHash[i] = binary.BigEndian.Uint64(simplifiedHash[i*8 : (i+1)*8])
-		witness.PackedBlockHash[i] = binary.BigEndian.Uint64(simulatedBH[i*8 : (i+1)*8])
+		witness.PackedValidatorsHash[i] = binary.BigEndian.Uint64(actualVH[i*8 : (i+1)*8])
+		witness.PackedBlockHash[i] = binary.BigEndian.Uint64(blockHash[i*8 : (i+1)*8])
 	}
 
 	// 5. Finalize Signatures in Witness using re-signing logic
@@ -371,10 +403,27 @@ func GenerateValidatorProof(cosmosRpcUrl string, height string, outputPath strin
 			seed := sha256.Sum256(pkBytes)
 			privKey := native_ed25519.NewKeyFromSeed(seed[:])
 
-			// Sign the SIMULATED block hash
-			sigBytes := native_ed25519.Sign(privKey, simulatedBH)
+			// 5. Canonical SignBytes for this vote
+			roundInt32 := int32(commitResp.Result.SignedHeader.Commit.Round)
+			voteBytes := ProtoEncodeVote(chainID, hInt.Int64(), roundInt32, blockHash[:], commitResp.Result.SignedHeader.Header.Time)
 
-			rx, ry, _ := DecompressEd25519Point(sigBytes[:32])
+			// THE PADDING FIX: Zero-pad to 112 bytes to match fixed-length circuit hashing
+			paddedVote := make([]byte, 112)
+			copy(paddedVote, voteBytes)
+			voteBytes = paddedVote
+
+			// Populate SignBytes witness
+			for j := 0; j < 112; j++ {
+				witness.SignBytes[i][j] = uints.U8{Val: voteBytes[j]}
+			}
+
+			// Sign the CANONICAL vote bytes
+			sigBytes := native_ed25519.Sign(privKey, voteBytes)
+
+			rx, ry, err := DecompressEd25519Point(sigBytes[:32])
+			if err != nil {
+				return blockHash, blockHash, nil, fmt.Errorf("failed to decompress signature R for validator %d: %v", i, err)
+			}
 			sBytes := make([]byte, 32)
 			copy(sBytes, sigBytes[32:64])
 			for j := 0; j < 16; j++ {
@@ -399,7 +448,7 @@ func GenerateValidatorProof(cosmosRpcUrl string, height string, outputPath strin
 	template.AllocateSlices()
 	ccs, err := frontend.Compile(ecc.BN254.ScalarField(), r1cs.NewBuilder, template)
 	if err != nil {
-		return simplifiedHash, simulatedBHArr, nil, fmt.Errorf("failed to compile validator circuit: %v", err)
+		return blockHash, blockHash, nil, fmt.Errorf("failed to compile validator circuit: %v", err)
 	}
 	fmt.Printf("📊 Validator Circuit compiled: %d constraints\n", ccs.GetNbConstraints())
 
@@ -416,7 +465,7 @@ func GenerateValidatorProof(cosmosRpcUrl string, height string, outputPath strin
 	pkPath := keysDir + "/Validators.proving.key"
 	pkFile, err := os.Open(pkPath)
 	if err != nil {
-		return simplifiedHash, simulatedBHArr, nil, fmt.Errorf("validators proving key not found at %s! Run 'go run cmd/setup/main.go'", pkPath)
+		return blockHash, blockHash, nil, fmt.Errorf("validators proving key not found at %s! Run 'go run cmd/setup/main.go'", pkPath)
 	}
 	pk.ReadFrom(pkFile)
 	pkFile.Close()
@@ -424,13 +473,13 @@ func GenerateValidatorProof(cosmosRpcUrl string, height string, outputPath strin
 	fmt.Println("⚙️  Step 3/4: Generating Validator Witness...")
 	fullWitness, err := frontend.NewWitness(&witness, ecc.BN254.ScalarField())
 	if err != nil {
-		return simplifiedHash, simulatedBHArr, nil, err
+		return blockHash, blockHash, nil, err
 	}
 
 	fmt.Println("🚀 Step 4/4: Calculating Validator ZK-SNARK Proof...")
 	proof, err := groth16.Prove(ccs, pk, fullWitness)
 	if err != nil {
-		return simplifiedHash, simulatedBHArr, nil, err
+		return blockHash, blockHash, nil, err
 	}
 
 	// 3. Export JSON
@@ -443,7 +492,7 @@ func GenerateValidatorProof(cosmosRpcUrl string, height string, outputPath strin
 	}
 	publicInputs[12] = hInt.String()
 	// Public Input 13: Total Power
-	publicInputs[13] = strconv.FormatInt(totalSigningPower, 10)
+	publicInputs[13] = strconv.FormatInt(totalPowerAll, 10)
 
 	data := struct {
 		A             [2]string    `json:"a"`
@@ -464,7 +513,10 @@ func GenerateValidatorProof(cosmosRpcUrl string, height string, outputPath strin
 
 	out, _ := json.MarshalIndent(data, "", "  ")
 	fmt.Printf("💾 Saving validator proof to %s\n", outputPath)
-	return simplifiedHash, simulatedBHArr, big.NewInt(totalSigningPower), os.WriteFile(outputPath, out, 0o644)
+
+	var actualVHArr [32]byte
+	copy(actualVHArr[:], actualVH)
+	return actualVHArr, blockHash, big.NewInt(totalPowerAll), os.WriteFile(outputPath, out, 0o644)
 }
 
 // GenerateTransitionProof fetches old and new validator sets, then generates ZK proof.
@@ -472,65 +524,78 @@ func GenerateTransitionProof(cosmosRpcUrl, oldHeight, newHeight, outputPath stri
 	proverMutex.Lock()
 	defer proverMutex.Unlock()
 
-	var simplifiedNewHashArr [32]byte
+	var actualNewVH [32]byte
 	client := rpc.NewCosmosClient(cosmosRpcUrl)
 
 	// Fetch Old Validator Set
 	fmt.Printf("📡 Fetching Old Validator Set at height %s...\n", oldHeight)
 	oldValResp, err := client.GetValidators(oldHeight)
 	if err != nil {
-		return simplifiedNewHashArr, err
+		return actualNewVH, err
 	}
 
 	// Fetch Commit (signatures for new set)
 	fmt.Printf("📡 Fetching Commit (signatures for new set) at height %s...\n", newHeight)
 	commitResp, err := client.GetCommit(newHeight)
 	if err != nil {
-		return simplifiedNewHashArr, err
+		return actualNewVH, err
 	}
 
 	var witness circuits.TransitionCircuit
 	witness.AllocateSlices()
 
-	// 1. Initialise arrays with defaults to avoid nil/empty issues in gnark
-	bx, by, _ := DecompressBasePoint()
+	// 1. Initialise arrays with Base Point for safety
+	bx, by, err := DecompressBasePoint()
+	if err != nil {
+		return actualNewVH, fmt.Errorf("failed to decompress base point: %v", err)
+	}
 	for i := 0; i < circuits.MaxValidators; i++ {
 		witness.VotingPowers[i] = big.NewInt(0)
+		witness.ProposerPriorities[i] = big.NewInt(0)
 		witness.Signed[i] = 0
 		witness.PublicKeys[i].A.X = emulated.ValueOf[ed25519.Ed25519Fp](bx)
 		witness.PublicKeys[i].A.Y = emulated.ValueOf[ed25519.Ed25519Fp](by)
 		witness.Signatures[i].R.X = emulated.ValueOf[ed25519.Ed25519Fp](bx)
 		witness.Signatures[i].R.Y = emulated.ValueOf[ed25519.Ed25519Fp](by)
 		witness.Signatures[i].S = emulated.ValueOf[ed25519.Ed25519Fr](0)
-	}
 
-	// 1. Initialise arrays with defaults to avoid nil/empty issues in gnark
-	// This will be later updated with simplifiedNewHashArr to match circuit expectations.
-	for i := 0; i < 4; i++ {
-		witness.PackedNewValidatorsHash[i] = 0 // Placeholder
-	}
-
-	// Populate OldValidatorsHash
-	// Since ValidatorsHash might be missing from valResp, we use the header from commitResp if heights match,
-	// or fetch the header for oldHeight if they don't.
-	var ovHash []byte
-	if commitResp.Result.SignedHeader.Header.Height == oldHeight {
-		ovHash, _ = rpc.DecodeHash(commitResp.Result.SignedHeader.Header.ValidatorsHash)
-	} else {
-		oldCommit, err := client.GetCommit(oldHeight)
-		if err != nil {
-			return simplifiedNewHashArr, fmt.Errorf("failed to fetch commit for old height %s: %v", oldHeight, err)
+		// Zero-pad byte arrays for bit-perfect hashing
+		for j := 0; j < 10; j++ {
+			witness.VotingPowerBytes[i][j] = uints.U8{Val: 0}
+			witness.ProposerPriorityBytes[i][j] = uints.U8{Val: 0}
 		}
-		ovHash, err = rpc.DecodeHash(oldCommit.Result.SignedHeader.Header.ValidatorsHash)
-		if err != nil {
-			return simplifiedNewHashArr, fmt.Errorf("failed to decode OldValidatorsHash: %v", err)
+		for j := 0; j < 112; j++ {
+			witness.SignBytes[i][j] = uints.U8{Val: 0}
 		}
 	}
-	for i := 0; i < 4; i++ {
-		witness.PackedOldValidatorsHash[i] = binary.BigEndian.Uint64(ovHash[i*8 : (i+1)*8])
+	for i := 0; i < 12; i++ {
+		witness.Timestamp[i] = uints.U8{Val: 0}
 	}
 
-	// ... Map Old Set and Signatures ...
+	// 1a. Canonical Header Hash for the NEW block
+	newHeaderLeaves := HashHeaderLeaves(*commitResp)
+	for i := 0; i < 14; i++ {
+		for j := 0; j < 32; j++ {
+			witness.NewHeaderLeaves[i][j] = uints.U8{Val: newHeaderLeaves[i][j]}
+		}
+	}
+
+	nhInt := new(big.Int)
+	nhInt.SetString(newHeight, 10)
+	witness.Height = nhInt
+	witness.Round = big.NewInt(int64(commitResp.Result.SignedHeader.Commit.Round))
+
+	newBlockHash, _ := rpc.DecodeHash(commitResp.Result.SignedHeader.Commit.BlockID.Hash)
+	for i := 0; i < 32; i++ {
+		witness.BlockID[i] = uints.U8{Val: newBlockHash[i]}
+	}
+
+	chainID := commitResp.Result.SignedHeader.Header.ChainID
+	for i := 0; i < 32 && i < len(chainID); i++ {
+		witness.ChainID[i] = uints.U8{Val: chainID[i]}
+	}
+
+	// 2. Map Old Set and Signatures
 	sigs := make(map[string]rpc.CommitSig)
 	for _, sig := range commitResp.Result.SignedHeader.Commit.Signatures {
 		sigs[sig.ValidatorAddress] = sig
@@ -558,9 +623,27 @@ func GenerateTransitionProof(cosmosRpcUrl, oldHeight, newHeight, outputPath stri
 		derivedPubKey := privKey.Public().(native_ed25519.PublicKey)
 
 		copy(oldPKs[i][:], derivedPubKey)
-		px, py, _ := DecompressEd25519Point(derivedPubKey)
+		px, py, err := DecompressEd25519Point(derivedPubKey)
+		if err != nil {
+			return actualNewVH, fmt.Errorf("failed to decompress old public key for validator %d: %v", i, err)
+		}
 		witness.PublicKeys[i].A.X = emulated.ValueOf[ed25519.Ed25519Fp](px)
 		witness.PublicKeys[i].A.Y = emulated.ValueOf[ed25519.Ed25519Fp](py)
+
+		// Bit-perfect Varint encoding
+		pBytes := ProtoEncodeInt64(oldPowers[i])
+		for j := 0; j < len(pBytes) && j < 10; j++ {
+			witness.VotingPowerBytes[i][j] = uints.U8{Val: pBytes[j]}
+		}
+
+		// Proposer Priority
+		priority, _ := strconv.ParseInt(v.ProposerPriority, 10, 64)
+		witness.ProposerPriorities[i] = big.NewInt(priority)
+
+		prBytes := ProtoEncodeInt64(priority)
+		for j := 0; j < len(prBytes) && j < 10; j++ {
+			witness.ProposerPriorityBytes[i][j] = uints.U8{Val: prBytes[j]}
+		}
 
 		_, signed := sigs[v.Address]
 		if signed {
@@ -570,75 +653,32 @@ func GenerateTransitionProof(cosmosRpcUrl, oldHeight, newHeight, outputPath stri
 		}
 	}
 
-	var simplifiedOldHash [32]byte
-	// 3. Finalize Old Set Hashing and Power metadata
-	// Use actual ValidatorsHash if available
-	actualOldHash, err := rpc.DecodeHash(commitResp.Result.SignedHeader.Header.ValidatorsHash)
-	if err == nil {
-		copy(simplifiedOldHash[:], actualOldHash)
-	} else {
-		simplifiedOldHash = CalculateSimplifiedValidatorsHash(oldPowers, oldPKs)
-	}
-
-	var totalSigningPower int64 = 0
+	var totalPowerAll int64 = 0
 	for i := 0; i < circuits.MaxValidators && i < len(oldValResp.Result.Validators); i++ {
-		if witness.Signed[i].(int) == 1 {
-			v := oldValResp.Result.Validators[i]
-			p, _ := strconv.ParseInt(v.VotingPower, 10, 64)
-			totalSigningPower += p
-		}
-	}
-	witness.TotalPower = big.NewInt(totalSigningPower)
-
-	for i := 0; i < 4; i++ {
-		witness.PackedOldValidatorsHash[i] = binary.BigEndian.Uint64(simplifiedOldHash[i*8 : (i+1)*8])
-	}
-
-	// 4. Calculate SIMPLIFIED hash of the NEW validator set (Signed Message)
-	newValResp, err := client.GetValidators(newHeight)
-	if err != nil {
-		return simplifiedNewHashArr, fmt.Errorf("failed to fetch new validator set: %v", err)
-	}
-	newPowers := make([]int64, circuits.MaxValidators)
-	newPKs := make([][32]byte, circuits.MaxValidators)
-	for i := 0; i < circuits.MaxValidators; i++ {
-		newPKs[i][0] = 0x01
-	}
-	for i := 0; i < circuits.MaxValidators && i < len(newValResp.Result.Validators); i++ {
-		v := newValResp.Result.Validators[i]
+		v := oldValResp.Result.Validators[i]
 		p, _ := strconv.ParseInt(v.VotingPower, 10, 64)
-		newPowers[i] = p
-
-		// Standardize NEW public keys
-		pkBytes, _ := base64.StdEncoding.DecodeString(v.PubKey.Value)
-		seed := sha256.Sum256(pkBytes)
-		privKey := native_ed25519.NewKeyFromSeed(seed[:])
-		derivedPubKey := privKey.Public().(native_ed25519.PublicKey)
-		copy(newPKs[i][:], derivedPubKey)
+		totalPowerAll += p
 	}
-	simplifiedNewHashArr = CalculateSimplifiedValidatorsHash(newPowers, newPKs)
-	fmt.Printf("🔍 Calculated NewSimplifiedValidatorsHash: %x\n", simplifiedNewHashArr)
+	witness.TotalPower = big.NewInt(totalPowerAll)
+
+	// Fetch OldValidatorsHash (Commit anchor)
+	oldCommit, err := client.GetCommit(oldHeight)
+	if err != nil {
+		return actualNewVH, fmt.Errorf("failed to fetch commit for old height %s: %v", oldHeight, err)
+	}
+	oldVH, _ := rpc.DecodeHash(oldCommit.Result.SignedHeader.Header.ValidatorsHash)
 	for i := 0; i < 4; i++ {
-		witness.PackedNewValidatorsHash[i] = binary.BigEndian.Uint64(simplifiedNewHashArr[i*8 : (i+1)*8])
+		witness.PackedOldValidatorsHash[i] = binary.BigEndian.Uint64(oldVH[i*8 : (i+1)*8])
 	}
 
-	// 5. Populate Anchor Metadata for New Set (BlockHash, DataHash, Height)
-	newDH, _ := rpc.DecodeHash(commitResp.Result.SignedHeader.Header.DataHash)
+	// 4a. Set NewValidatorsHash Public Inputs
+	actualNVH, _ := rpc.DecodeHash(commitResp.Result.SignedHeader.Header.ValidatorsHash)
+	copy(actualNewVH[:], actualNVH)
+	for i := 0; i < 4; i++ {
+		witness.PackedNewValidatorsHash[i] = binary.BigEndian.Uint64(actualNVH[i*8 : (i+1)*8])
+	}
 
-	// Calculate SIMULATED BlockHash for the new set (Message signed by Old Set)
-	h := sha256.New()
-	h.Write(simplifiedNewHashArr[:])
-	h.Write(newDH)
-
-	nhInt := new(big.Int)
-	nhInt.SetString(newHeight, 10)
-	heightBytes := make([]byte, 8)
-	binary.LittleEndian.PutUint64(heightBytes, uint64(nhInt.Int64()))
-	h.Write(heightBytes)
-	simulatedNewBH := h.Sum(nil)
-	fmt.Printf("🔍 Calculated SimulatedNewBlockHash: %x\n", simulatedNewBH)
-
-	// Finalize Signatures for Transition proof logic using re-signing logic
+	// 5. Finalize Signatures in Witness using canonical logic
 	for i := 0; i < circuits.MaxValidators; i++ {
 		if i < len(oldValResp.Result.Validators) && witness.Signed[i].(int) == 1 {
 			v := oldValResp.Result.Validators[i]
@@ -646,10 +686,24 @@ func GenerateTransitionProof(cosmosRpcUrl, oldHeight, newHeight, outputPath stri
 			seed := sha256.Sum256(pkBytes)
 			privKey := native_ed25519.NewKeyFromSeed(seed[:])
 
-			// Sign the SIMULATED new block hash
-			sigBytes := native_ed25519.Sign(privKey, simulatedNewBH)
+			roundInt32 := int32(commitResp.Result.SignedHeader.Commit.Round)
+			voteBytes := ProtoEncodeVote(chainID, nhInt.Int64(), roundInt32, newBlockHash, commitResp.Result.SignedHeader.Header.Time)
 
-			rx, ry, _ := DecompressEd25519Point(sigBytes[:32])
+			// THE PADDING FIX: Zero-pad to 112 bytes to match fixed-length circuit hashing
+			paddedVote := make([]byte, 112)
+			copy(paddedVote, voteBytes)
+			voteBytes = paddedVote
+
+			for j := 0; j < 112; j++ {
+				witness.SignBytes[i][j] = uints.U8{Val: voteBytes[j]}
+			}
+
+			sigBytes := native_ed25519.Sign(privKey, voteBytes)
+
+			rx, ry, err := DecompressEd25519Point(sigBytes[:32])
+			if err != nil {
+				return actualNewVH, fmt.Errorf("failed to decompress signature R for old validator %d: %v", i, err)
+			}
 			sBytes := make([]byte, 32)
 			copy(sBytes, sigBytes[32:64])
 			for j := 0; j < 16; j++ {
@@ -661,17 +715,16 @@ func GenerateTransitionProof(cosmosRpcUrl, oldHeight, newHeight, outputPath stri
 			witness.Signatures[i].R.Y = emulated.ValueOf[ed25519.Ed25519Fp](ry)
 			witness.Signatures[i].S = emulated.ValueOf[ed25519.Ed25519Fr](sVal)
 		} else if i >= len(oldValResp.Result.Validators) {
-			bx, by, _ := DecompressBasePoint()
+			bx, by, err := DecompressBasePoint()
+			if err != nil {
+				return actualNewVH, fmt.Errorf("failed to decompress base point for empty slot %d: %v", i, err)
+			}
 			witness.PublicKeys[i].A.X = emulated.ValueOf[ed25519.Ed25519Fp](bx)
 			witness.PublicKeys[i].A.Y = emulated.ValueOf[ed25519.Ed25519Fp](by)
 		}
 	}
 
-	for i := 0; i < 4; i++ {
-		witness.PackedNewBlockHash[i] = binary.BigEndian.Uint64(simulatedNewBH[i*8 : (i+1)*8])
-		witness.PackedNewDataHash[i] = binary.BigEndian.Uint64(newDH[i*8 : (i+1)*8])
-	}
-	witness.NewHeight = nhInt
+	// Public Input Anchor and height already set.
 
 	// 6. Compile and Prove (Groth16)
 	fmt.Println("⚙️  Compiling Transition Circuit...")
@@ -679,7 +732,7 @@ func GenerateTransitionProof(cosmosRpcUrl, oldHeight, newHeight, outputPath stri
 	template.AllocateSlices()
 	ccs, err := frontend.Compile(ecc.BN254.ScalarField(), r1cs.NewBuilder, template)
 	if err != nil {
-		return simplifiedNewHashArr, fmt.Errorf("failed to compile transition circuit: %v", err)
+		return actualNewVH, fmt.Errorf("failed to compile transition circuit: %v", err)
 	}
 	fmt.Printf("📊 Transition Circuit compiled: %d constraints\n", ccs.GetNbConstraints())
 
@@ -696,7 +749,7 @@ func GenerateTransitionProof(cosmosRpcUrl, oldHeight, newHeight, outputPath stri
 	pkPath := keysDir + "/Transitions.proving.key"
 	pkFile, err := os.Open(pkPath)
 	if err != nil {
-		return simplifiedNewHashArr, fmt.Errorf("transitions proving key not found at %s! Run 'go run cmd/setup/main.go'", pkPath)
+		return actualNewVH, fmt.Errorf("transitions proving key not found at %s! Run 'go run cmd/setup/main.go'", pkPath)
 	}
 	pk.ReadFrom(pkFile)
 	pkFile.Close()
@@ -704,13 +757,13 @@ func GenerateTransitionProof(cosmosRpcUrl, oldHeight, newHeight, outputPath stri
 	fmt.Println("⚙️  Step 3/4: Generating Transition Witness...")
 	fullWitness, err := frontend.NewWitness(&witness, ecc.BN254.ScalarField())
 	if err != nil {
-		return simplifiedNewHashArr, err
+		return actualNewVH, err
 	}
 
 	fmt.Println("🚀 Step 4/4: Calculating Transition ZK-SNARK Proof...")
 	proof, err := groth16.Prove(ccs, pk, fullWitness)
 	if err != nil {
-		return simplifiedNewHashArr, err
+		return actualNewVH, err
 	}
 	bn254Proof := proof.(*gnark_bn254.Proof)
 
@@ -741,7 +794,7 @@ func GenerateTransitionProof(cosmosRpcUrl, oldHeight, newHeight, outputPath stri
 
 	out, _ := json.MarshalIndent(data, "", "  ")
 	fmt.Printf("💾 Saving transition proof to %s\n", outputPath)
-	return simplifiedNewHashArr, os.WriteFile(outputPath, out, 0o644)
+	return actualNewVH, os.WriteFile(outputPath, out, 0o644)
 }
 
 // UpdateValidatorSetOnEth submits a transition proof to the Ethereum bridge.
