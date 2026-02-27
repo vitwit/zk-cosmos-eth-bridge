@@ -255,8 +255,6 @@ func GenerateValidatorProof(cosmosRpcUrl string, height string, outputPath strin
 		return blockHash, blockHash, nil, fmt.Errorf("no signatures found in commit at height %s - the block may not be finalized yet", height)
 	}
 	// 1. Prepare Witness
-
-	// 1. Prepare Witness
 	var witness circuits.ValidatorCircuit
 	witness.AllocateSlices()
 
@@ -293,6 +291,7 @@ func GenerateValidatorProof(cosmosRpcUrl string, height string, outputPath strin
 	}
 
 	// 1. Unpack Header and Metadata
+	witness.ValidatorCount = len(valResp.Result.Validators)
 	headerLeaves := HashHeaderLeaves(*commitResp)
 	for i := 0; i < 14; i++ {
 		for j := 0; j < 32; j++ {
@@ -304,6 +303,9 @@ func GenerateValidatorProof(cosmosRpcUrl string, height string, outputPath strin
 	hInt.SetString(height, 10)
 	witness.Height = hInt
 	witness.Round = big.NewInt(int64(commitResp.Result.SignedHeader.Commit.Round))
+	for i := 0; i < 4; i++ {
+		witness.PackingHelper[i] = 0
+	}
 
 	dHash, _ := rpc.DecodeHash(commitResp.Result.SignedHeader.Header.DataHash)
 	for i := 0; i < 4; i++ {
@@ -542,6 +544,7 @@ func GenerateTransitionProof(cosmosRpcUrl, oldHeight, newHeight, outputPath stri
 	}
 
 	var witness circuits.TransitionCircuit
+	witness.ValidatorCount = len(oldValResp.Result.Validators)
 	witness.AllocateSlices()
 
 	// 1. Initialise arrays with Base Point for safety
@@ -583,6 +586,7 @@ func GenerateTransitionProof(cosmosRpcUrl, oldHeight, newHeight, outputPath stri
 	nhInt := new(big.Int)
 	nhInt.SetString(newHeight, 10)
 	witness.Height = nhInt
+
 	witness.Round = big.NewInt(int64(commitResp.Result.SignedHeader.Commit.Round))
 
 	newBlockHash, _ := rpc.DecodeHash(commitResp.Result.SignedHeader.Commit.BlockID.Hash)

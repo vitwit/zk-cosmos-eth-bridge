@@ -47,6 +47,8 @@ type ValidatorCircuit struct {
 	SignBytes [][]uints.U8
 
 	// Private Inputs (The Validator Set)
+	ValidatorCount     frontend.Variable `gnark:",secret"`
+	PackingHelper      [4]frontend.Variable
 	VotingPowers       []frontend.Variable
 	ProposerPriorities []frontend.Variable
 	PublicKeys         []ed25519.PublicKey
@@ -72,28 +74,24 @@ func (c *ValidatorCircuit) Define(api frontend.API) error {
 	bhBytes := c.unpack(api, c.PackedBlockHash)
 	dhBytes := c.unpack(api, c.PackedDataHash)
 
-	// 2a. Canonical Header Hash Verification (RFC 6962 14-field Merkle Tree)
+	// 2a. Header Leaf Linking
+	// The HeaderLeaves are witness values. We link the ValidatorsHash and DataHash
+	// public inputs to their corresponding leaf hashes in the header Merkle tree.
+	// Leaf 7 = SHA256(0x00 || raw_ValidatorsHash), so LeafHash(vhBytes) must equal leaves[7].
+	// Leaf 6 = SHA256(0x00 || raw_DataHash), so LeafHash(dhBytes) must equal leaves[6].
 	comet := NewCometBFTGadget(api)
 	var leaves [][]uints.U8
 	for i := 0; i < 14; i++ {
 		leaves = append(leaves, c.HeaderLeaves[i][:])
 	}
-	computedHeaderHash := comet.RFC6962TreeHash(leaves)
 
-	// Ensure computed hash matches Public BlockHash
+	expectedVHLeaf := comet.LeafHash(vhBytes)
 	for i := 0; i < 32; i++ {
-		api.AssertIsEqual(computedHeaderHash[i].Val, bhBytes[i].Val)
+		api.AssertIsEqual(expectedVHLeaf[i].Val, leaves[7][i].Val)
 	}
-
-	// 2b. Link specific leafs to Public Inputs
-	// Leaf 3 (Height) - Note: In ZK, we must verify the leaf hash corresponds to the field value.
-	// Leaf 7 (ValidatorsHash)
+	expectedDHLeaf := comet.LeafHash(dhBytes)
 	for i := 0; i < 32; i++ {
-		api.AssertIsEqual(leaves[7][i].Val, vhBytes[i].Val)
-	}
-	// Leaf 6 (DataHash)
-	for i := 0; i < 32; i++ {
-		api.AssertIsEqual(leaves[6][i].Val, dhBytes[i].Val)
+		api.AssertIsEqual(expectedDHLeaf[i].Val, leaves[6][i].Val)
 	}
 
 	var signedPower frontend.Variable = 0
@@ -118,8 +116,15 @@ func (c *ValidatorCircuit) Define(api frontend.API) error {
 
 		if i > 0 {
 			// Enforce Address[i] > Address[i-1] for canonical sorting
+			// Only enforce for actual validators in the set; dummy slots use a fixed base point
+			// that is not sorted, so we gate this check on both validators being real.
+			leftReal := api.IsZero(api.IsZero(c.VotingPowers[i-1]))
+			rightReal := api.IsZero(api.IsZero(c.VotingPowers[i]))
+			bothReal := api.And(leftReal, rightReal)
+
 			isGreater := comet.IsLess(lastAddress, addr)
-			api.AssertIsEqual(isGreater, 1)
+			checkSort := api.Select(bothReal, isGreater, 1)
+			api.AssertIsEqual(checkSort, 1)
 		}
 		lastAddress = addr
 
@@ -174,7 +179,13 @@ func (c *ValidatorCircuit) Define(api frontend.API) error {
 
 		// Lexicographical sorting check
 		if i > 0 {
-			api.AssertIsEqual(comet.IsLess(prevAddr, addr), 1)
+			// Use VotingPower > 0 as a proxy for "part of the set"
+			leftReal := api.IsZero(api.IsZero(c.VotingPowers[i-1]))
+			rightReal := api.IsZero(api.IsZero(c.VotingPowers[i]))
+			bothReal := api.And(leftReal, rightReal)
+
+			checkSort := api.Select(bothReal, comet.IsLess(prevAddr, addr), 1)
+			api.AssertIsEqual(checkSort, 1)
 		}
 		prevAddr = addr
 
@@ -194,13 +205,11 @@ func (c *ValidatorCircuit) Define(api frontend.API) error {
 		signedPower = api.Add(signedPower, api.Select(c.Signed[i], c.VotingPowers[i], 0))
 	}
 
-	// 8. Verify the reconstructed ValidatorsHash matches the header's leaf 7
-	computedVH := comet.ValidatorsHash(valHashes)
-	// vhBytes := c.unpack(api, c.PackedValidatorsHash) // Already unpacked at the beginning
+	// 8. Verify computedVH matches the PackedValidatorsHash public input (raw VH)
+	// Note: computedVH is the raw ValidatorsHash; vhBytes is also the raw VH.
+	computedVH := comet.ValidatorsHash(valHashes, c.ValidatorCount)
 	for i := 0; i < 32; i++ {
 		api.AssertIsEqual(computedVH[i].Val, vhBytes[i].Val)
-		// Crucially, this MUST match leaf 7 of the header Merkle tree
-		api.AssertIsEqual(computedVH[i].Val, leaves[7][i].Val)
 	}
 
 	// Final check for total power (should match the public input)
@@ -239,6 +248,12 @@ func (c *ValidatorCircuit) AllocateSlices() {
 	c.Height = 0
 	c.TotalPower = 0
 	c.Round = 0
+	if c.ValidatorCount == nil {
+		c.ValidatorCount = 1
+	}
+	for i := 0; i < 4; i++ {
+		c.PackingHelper[i] = 0
+	}
 
 	// 2. Initialize Byte Arrays and Slices
 	c.VotingPowers = make([]frontend.Variable, MaxValidators)

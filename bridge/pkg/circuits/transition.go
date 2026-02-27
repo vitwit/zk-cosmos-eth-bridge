@@ -34,6 +34,7 @@ type TransitionCircuit struct {
 	ProposerPriorities []frontend.Variable
 	PublicKeys         []ed25519.PublicKey
 	TotalPower         frontend.Variable
+	ValidatorCount     frontend.Variable `gnark:",secret"`
 
 	// Byte representations for bit-perfect ValidatorsHash reconstruction (of the OLD set)
 	VotingPowerBytes      [][]uints.U8
@@ -72,7 +73,13 @@ func (c *TransitionCircuit) Define(api frontend.API) error {
 		// Address & Sorting
 		addr := comet.ComputeAddress(pkBytes[:])
 		if i > 0 {
-			api.AssertIsEqual(comet.IsLess(prevAddr, addr), 1)
+			// Use VotingPower > 0 as a proxy for "part of the set"
+			leftReal := api.IsZero(api.IsZero(c.VotingPowers[i-1]))
+			rightReal := api.IsZero(api.IsZero(c.VotingPowers[i]))
+			bothReal := api.And(leftReal, rightReal)
+
+			checkSort := api.Select(bothReal, comet.IsLess(prevAddr, addr), 1)
+			api.AssertIsEqual(checkSort, 1)
 		}
 		prevAddr = addr
 
@@ -86,9 +93,10 @@ func (c *TransitionCircuit) Define(api frontend.API) error {
 		valHashes[i] = comet.HashValidator(addr, protoPK, c.VotingPowerBytes[i], c.ProposerPriorityBytes[i])
 	}
 
-	actualOldHash := comet.ValidatorsHash(valHashes)
+	// 4. Verify the reconstructed OLD ValidatorsHash
+	computedVH := comet.ValidatorsHash(valHashes, c.ValidatorCount)
 	for i := 0; i < 32; i++ {
-		api.AssertIsEqual(actualOldHash[i].Val, oldVhBytes[i].Val)
+		api.AssertIsEqual(computedVH[i].Val, oldVhBytes[i].Val)
 	}
 
 	// 2. Canonical Header Hash Verification for the NEW block
@@ -98,10 +106,13 @@ func (c *TransitionCircuit) Define(api frontend.API) error {
 	}
 	computedNewBH := comet.RFC6962TreeHash(newLeaves)
 
-	// Ensure NewBlockHash commits to NewValidatorsHash (Public Input)
+	// Ensure NewValidatorsHash public input corresponds to leaf 7 of the new header
+	// newLeaves[7] = SHA256(0x00 || raw_new_ValidatorsHash), newVhBytes = raw_new_ValidatorsHash
+	// So compute LeafHash(newVhBytes) in-circuit and compare to newLeaves[7]
 	newVhBytes := c.unpack(api, c.PackedNewValidatorsHash)
+	expectedNewVHLeaf := comet.LeafHash(newVhBytes)
 	for i := 0; i < 32; i++ {
-		api.AssertIsEqual(newLeaves[7][i].Val, newVhBytes[i].Val)
+		api.AssertIsEqual(expectedNewVHLeaf[i].Val, newLeaves[7][i].Val)
 	}
 
 	var signedPower frontend.Variable = 0
@@ -124,7 +135,12 @@ func (c *TransitionCircuit) Define(api frontend.API) error {
 		addr := comet.ComputeAddress(pkBytes[:])
 
 		if i > 0 {
-			api.AssertIsEqual(comet.IsLess(lastAddress, addr), 1)
+			// Gate sorting check — dummy slots share the same generator key and wouldn't be sorted
+			leftReal := api.IsZero(api.IsZero(c.VotingPowers[i-1]))
+			rightReal := api.IsZero(api.IsZero(c.VotingPowers[i]))
+			bothReal := api.And(leftReal, rightReal)
+			checkSort := api.Select(bothReal, comet.IsLess(lastAddress, addr), 1)
+			api.AssertIsEqual(checkSort, 1)
 		}
 		lastAddress = addr
 
@@ -173,6 +189,9 @@ func (c *TransitionCircuit) AllocateSlices() {
 	c.Height = 0
 	c.TotalPower = 0
 	c.Round = 0
+	if c.ValidatorCount == nil {
+		c.ValidatorCount = 1
+	}
 
 	// 2. Initialize Byte Arrays and Slices
 	c.VotingPowers = make([]frontend.Variable, MaxValidators)

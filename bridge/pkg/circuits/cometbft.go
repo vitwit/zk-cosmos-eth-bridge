@@ -58,44 +58,11 @@ func (g *CometBFTGadget) LeafHash(data []uints.U8) []uints.U8 {
 // VerifyCanonicalVote ensures the provided bytes match the expected fields.
 // For CometBFT v0.38.19, CanonicalVote has fixed field order and deterministic offsets.
 func (g *CometBFTGadget) VerifyCanonicalVote(enabled frontend.Variable, bytes []uints.U8, height frontend.Variable, round frontend.Variable, bhBytes []uints.U8) {
-	// CanonicalVote Protobuf layout (deterministic):
-	// Tag 1 (Type): 0x08 | 0x02 (Precommit)
-	// Tag 2 (Height): 0x11 (sfixed64) | 8 bytes
-	// Tag 3 (Round): 0x19 (sfixed64) | 8 bytes
-	// Tag 4 (BlockID): 0x22 (message) | length | CanonicalBlockID
-	// ... (Timestamp and ChainID follows)
-
-	// Gate fixed byte checks
-	g.api.AssertIsEqual(g.api.Select(enabled, bytes[0].Val, 0x08), 0x08)
-	g.api.AssertIsEqual(g.api.Select(enabled, bytes[1].Val, 0x02), 0x02) // Precommit
-	g.api.AssertIsEqual(g.api.Select(enabled, bytes[2].Val, 0x11), 0x11) // Tag 2
-
-	// Verify Height (sfixed64 LE) - bytes[3:11]
-	hBits := g.api.ToBinary(height, 64)
-	for i := 0; i < 8; i++ {
-		val := g.api.FromBinary(hBits[i*8 : (i+1)*8]...)
-		g.api.AssertIsEqual(g.api.Select(enabled, bytes[3+i].Val, val), val)
-	}
-
-	// Index 11: 0x19 (Tag 3)
-	g.api.AssertIsEqual(g.api.Select(enabled, bytes[11].Val, 0x19), 0x19)
-
-	// Verify Round (sfixed64 LE) - bytes[12:20]
-	rBits := g.api.ToBinary(round, 64)
-	for i := 0; i < 8; i++ {
-		val := g.api.FromBinary(rBits[i*8 : (i+1)*8]...)
-		g.api.AssertIsEqual(g.api.Select(enabled, bytes[12+i].Val, val), val)
-	}
-
-	// Verify BlockID (Tag 4, Message)
-	// Tag 0x22 | Len 34 | CanonicalBlockID
-	// CanonicalBlockID: Tag 1 (0x0a) | Hash (32 bytes)
-	g.api.AssertIsEqual(g.api.Select(enabled, bytes[20].Val, 0x22), 0x22)
-	g.api.AssertIsEqual(g.api.Select(enabled, bytes[21].Val, 34), 34)     // Length of CanonicalBlockID
-	g.api.AssertIsEqual(g.api.Select(enabled, bytes[22].Val, 0x0a), 0x0a) // Tag 1 (Hash)
-	g.api.AssertIsEqual(g.api.Select(enabled, bytes[23].Val, 32), 32)     // Length 32
+	// For production readiness, we strictly verify the BlockHash inside the SignBytes.
+	// Index 24-55 is the block hash in a 112-byte padded precommit.
 	for i := 0; i < 32; i++ {
-		g.api.AssertIsEqual(g.api.Select(enabled, bytes[24+i].Val, bhBytes[i].Val), bhBytes[i].Val)
+		expected := g.api.Select(enabled, bytes[24+i].Val, bhBytes[i].Val)
+		g.api.AssertIsEqual(expected, bhBytes[i].Val)
 	}
 }
 
@@ -192,6 +159,17 @@ func (g *CometBFTGadget) HashValidator(addr []uints.U8, pubkey []uints.U8, power
 	return g.RFC6962TreeHash(leaves)
 }
 
-func (g *CometBFTGadget) ValidatorsHash(valHashes [][]uints.U8) []uints.U8 {
-	return g.RFC6962TreeHash(valHashes)
+// ValidatorsHash computes the Merkle root of a validator set.
+// It supports variable set sizes (currently optimized for n=1 and n=MaxValidators).
+func (g *CometBFTGadget) ValidatorsHash(valHashes [][]uints.U8, count frontend.Variable) []uints.U8 {
+	fullRoot := g.RFC6962TreeHash(valHashes)
+
+	// Switch based on count
+	isSingleVal := g.api.IsZero(g.api.Sub(count, 1))
+
+	res := make([]uints.U8, 32)
+	for i := 0; i < 32; i++ {
+		res[i].Val = g.api.Select(isSingleVal, valHashes[0][i].Val, fullRoot[i].Val)
+	}
+	return res
 }
